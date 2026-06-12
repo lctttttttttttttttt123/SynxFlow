@@ -1,0 +1,10 @@
+# Build artifacts (cuda-dev editable build: pip install -e .)
+*.so
+*.so/
+*.egg-info/
+build/
+_skbuild/
+__pycache__/
+*.py[cod]
+*.o
+*.obj
