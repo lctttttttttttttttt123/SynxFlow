@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+#
+# pre-commit — SynxFlow transport 发布边界守卫 (default-deny / 白名单优先)
+# ---------------------------------------------------------------------------
+# 权威说明: 见仓库根 PUBLICATION_BOUNDARY.md。
+# 本文件是版本库内的权威副本 (scripts/pre-commit)。裸 .git/hooks 不进版本库,
+# 故安装步骤 (见 doc) 必须可复现:
+#     git config core.hooksPath scripts          # 推荐, 一行
+#   或  ln -sf ../../scripts/pre-commit .git/hooks/pre-commit
+#
+# 放行条件 (三者须同时满足, 任一不满足即拦):
+#   (1) 路径/扩展名命中【白名单】(default-deny: 未授权一律拒)
+#   (2) 文件名【不命中关键词黑名单】(即便扩展名在白名单内也拦, 防敏感内容夹带)
+#   (3) 单文件 <= 5 MB
+#   附加 (上一轮约定保留): 脚本 (.sh/.py) 内容不得含驱动器绝对路径 (F:\ 或 /mnt/<drive>/)
+#
+# 命中任一 -> 打印命中清单并 exit 1。
+# 注意: --no-verify 能在本地绕过本钩子; transport 开发期【禁止】任何绕过标志
+#       (唯一可接受的 "no-" 标志是 git commit --amend --no-edit)。详见 doc。
+# ---------------------------------------------------------------------------
+set -u
+export LC_ALL=C.UTF-8 2>/dev/null || true
+
+MAX_BYTES=$((5 * 1024 * 1024))   # 5 MB
+
+# --- 扩展名白名单 (小写) ---
+ext_ok() {
+  case "$1" in
+    cu|cuh|cpp|hpp|h|c) return 0 ;;        # C/C++/CUDA 源码
+    py)                 return 0 ;;        # Python
+    cmake|toml|cfg|ini) return 0 ;;        # 构建/配置
+    sh)                 return 0 ;;        # 脚本
+    md)                 return 0 ;;        # 文档 (.txt 另有路径限制, 见下)
+    yml|yaml|json)      return 0 ;;        # 配置 (json 限构建/配置用途 — 策略层, 见 doc)
+  esac
+  return 1
+}
+
+# --- 关键词黑名单 (匹配文件路径, 大小写不敏感): 鄱阳湖流域专名 + 结构性 token ---
+KW_RE='poyang|鄱阳|ganjiang|赣江|xinjiang|信江|fuhe|抚河|raohe|饶河|xingzi|星子|duchang|都昌|tangyin|kangshan|康山|case_9|prep_|obs_'
+
+blocked=()
+while IFS= read -r -d '' f; do
+  reason=""
+  base=$(basename "$f")
+  ext="${base##*.}"; [ "$ext" = "$base" ] && ext=""          # 无扩展名 -> 空
+  lc_ext=$(printf '%s' "$ext" | tr 'A-Z' 'a-z')
+
+  # ---- (1) 白名单判定 (default-deny) ----
+  wl=1                                                        # 1 = 不在白名单
+  if [[ "$f" == validation/synthetic/* ]]; then
+    wl=0                                                      # 合成验证算例数据 (位置白名单, 教科书构造)
+  elif [ "$base" = "CMakeLists.txt" ] || [ "$base" = ".gitignore" ] || [ "$base" = ".gitattributes" ]; then
+    wl=0                                                      # 具名文件 (可在任意子目录)
+  elif [ "$f" = "scripts/pre-commit" ]; then
+    wl=0                                                      # 钩子自身 (具名)
+  elif [ "$lc_ext" = "txt" ]; then
+    if [[ "$f" != */* ]] || [[ "$f" == docs/* ]]; then wl=0; fi   # .txt 仅限仓库根与 docs/
+  elif ext_ok "$lc_ext"; then
+    wl=0
+  fi
+  [ "$wl" -ne 0 ] && reason="不在白名单 (扩展名/路径未授权)"
+
+  # ---- (2) 关键词黑名单 (即便扩展名白名单也拦) ----
+  if printf '%s' "$f" | grep -qiE "$KW_RE"; then
+    reason="${reason:+$reason; }命中关键词黑名单 (鄱阳湖流域专名/数据 token)"
+  fi
+
+  # ---- (3) 单文件大小 ----
+  sz=$(git cat-file -s ":$f" 2>/dev/null || echo 0)
+  if [ "${sz:-0}" -gt "$MAX_BYTES" ]; then
+    reason="${reason:+$reason; }单文件 ${sz}B > 5MB"
+  fi
+
+  # ---- 附加: 脚本含驱动器绝对路径 ----
+  if [ "$lc_ext" = "sh" ] || [ "$lc_ext" = "py" ]; then
+    if git show ":$f" 2>/dev/null | grep -qE '[A-Za-z]:\\|/mnt/[a-z]+/'; then
+      reason="${reason:+$reason; }脚本含驱动器绝对路径 (F:\\ 或 /mnt/<drive>/)"
+    fi
+  fi
+
+  [ -n "$reason" ] && blocked+=("$f  —  $reason")
+done < <(git diff --cached --name-only -z --diff-filter=ACMR)
+
+if [ ${#blocked[@]} -gt 0 ]; then
+  echo "✗ pre-commit 拦截 — 发布边界违规 (见 PUBLICATION_BOUNDARY.md):" >&2
+  for b in "${blocked[@]}"; do echo "    ✗ $b" >&2; done
+  echo "  处置: git restore --staged <文件> 取消暂存, 或把数据移出仓库工作树。" >&2
+  echo "  【禁止】用 --no-verify 绕过 (transport 开发期硬约束)。" >&2
+  exit 1
+fi
+exit 0

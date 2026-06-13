@@ -8,3 +8,24 @@ __pycache__/
 *.py[cod]
 *.o
 *.obj
+
+# ── 发布边界 (软层; 硬闸是 scripts/pre-commit) — 见 PUBLICATION_BOUNDARY.md ──
+# 地形/栅格/观测数据格式: 绝不进库
+*.asc
+*.nc
+*.tif
+*.tiff
+*.grd
+*.dem
+*.dat
+*.csv
+# 鄱阳湖流域专名 / 数据目录 token (任意层级)
+*poyang*
+*ganjiang*
+*kangshan*
+case_9*
+prep_*
+obs_*
+# 例外: 合成验证算例数据 (教科书构造, 无真实流域来源) 显式放行
+!validation/synthetic/
+!validation/synthetic/**
