@@ -92,17 +92,18 @@ class InputModel:
                           'sewer_sink':0,
                           'cumulative_depth':0, 'hydraulic_conductivity':0,
                           'capillary_head':0, 'water_content_diff':0,
+                          'C':0,
                           'gauges_pos':np.array([[0, 0], [1, 1]])}
     _file_tag_list = ['z', 'h', 'hU', 'precipitation',
                       'manning', 'sewer_sink',
                       'cumulative_depth', 'hydraulic_conductivity',
-                      'capillary_head', 'water_content_diff',
+                      'capillary_head', 'water_content_diff', 'C',
                       'precipitation_mask', 'precipitation_source',
                       'boundary_condition', 'gauges_pos']
     __grid_files = ['z', 'h', 'hU', 'precipitation_mask',
                   'manning', 'sewer_sink', 'precipitation',
                   'cumulative_depth', 'hydraulic_conductivity',
-                  'capillary_head', 'water_content_diff']
+                  'capillary_head', 'water_content_diff', 'C']
     gridded_parameter_keys = ['h0', 'hU0x', 'hU0y', 'manning', 'sewer_sink',
                            'cumulative_depth', 'hydraulic_conductivity',
                            'capillary_head', 'water_content_diff']

@@ -58,9 +58,14 @@ namespace GC{
     ///A fast 1st order hydrostatic reconstruction method for SWEs on Cartesian grids only Asymptotic Preserving    
     void cuAdvectionSWEsAPCartesian(cuFvMappedField<Scalar, on_cell>& manning, cuFvMappedField<Scalar, on_cell>& gravity, cuFvMappedField<Scalar, on_cell>& h, cuFvMappedField<Scalar, on_cell>& z, cuFvMappedField<Vector, on_cell>& hU, cuFvMappedField<Scalar, on_cell>& h_advection, cuFvMappedField<Vector, on_cell>& hU_advection);
 
-    ///A fast 1st order surface reconstruction method for SWEs on Cartesian grids only 
+    ///A fast 1st order surface reconstruction method for SWEs on Cartesian grids only
     void cuAdvectionMSWEsCartesian(cuFvMappedField<Scalar, on_cell>& gravity, cuFvMappedField<Scalar, on_cell>& h, cuFvMappedField<Scalar, on_cell>& z, cuFvMappedField<Vector, on_cell>& z_gradient, cuFvMappedField<Vector, on_cell>& hU, cuFvMappedField<Scalar, on_cell>& h_advection, cuFvMappedField<Vector, on_cell>& hU_advection);
-    
+
+    ///T2 passive conservative tracer "rider": reuses cuAdvectionMSWEsCartesian reconstruction + the same
+    ///cuHLLCRiemannSolverSWEs mass flux; outputs ONLY hC_advection (hC_flux = mass_flux * c_upwind).
+    ///flood h/hU stays on cuAdvectionMSWEsCartesian (untouched). C供边界浓度(C.boundary_value), hC为守恒态。
+    void cuAdvectionScalarRiderCartesian(cuFvMappedField<Scalar, on_cell>& gravity, cuFvMappedField<Scalar, on_cell>& h, cuFvMappedField<Scalar, on_cell>& z, cuFvMappedField<Vector, on_cell>& z_gradient, cuFvMappedField<Vector, on_cell>& hU, cuFvMappedField<Scalar, on_cell>& C, cuFvMappedField<Scalar, on_cell>& hC, cuFvMappedField<Scalar, on_cell>& hC_advection);
+
     ///A fast 1st order surface reconstruction method for non-hydrostatic SWEs on Cartesian grids only
     void cuAdvectionNSWEsSRMCartesian(cuFvMappedField<Scalar, on_cell>& gravity, cuFvMappedField<Scalar, on_cell>& centrifugal, cuFvMappedField<Scalar, on_cell>& h, cuFvMappedField<Scalar, on_cell>& z, cuFvMappedField<Vector, on_cell>& z_gradient, cuFvMappedField<Vector, on_cell>& hU, cuFvMappedField<Scalar, on_cell>& h_advection, cuFvMappedField<Vector, on_cell>& hU_advection);
 

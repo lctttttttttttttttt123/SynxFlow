@@ -162,6 +162,9 @@ int run(const char* work_dir){
   fvVectorFieldOnCell hU_host(fvMeshQueries(mesh), completeFieldReader("input/field/", "hU"));
   fvScalarFieldOnCell manning_coef_host(fvMeshQueries(mesh), completeFieldReader("input/field/", "manning"));
 
+  //T2 passive tracer C (initial concentration field)
+  fvScalarFieldOnCell C_host(fvMeshQueries(mesh), completeFieldReader("input/field/", "C"));
+
   //precipitation
   fvScalarFieldOnCell precipitation_host(fvMeshQueries(mesh), completeFieldReader("input/field/", "precipitation"));
 
@@ -183,6 +186,9 @@ int run(const char* work_dir){
   cuFvMappedField<Scalar, on_cell> h(h_host,mesh_ptr_dev);
   cuFvMappedField<Vector, on_cell> hU(hU_host, mesh_ptr_dev);
   cuFvMappedField<Scalar, on_cell> manning_coef(manning_coef_host, mesh_ptr_dev);
+  //T2 passive tracer: concentration C (device) + conserved quantity hC = h*C
+  cuFvMappedField<Scalar, on_cell> C(C_host, mesh_ptr_dev);
+  cuFvMappedField<Scalar, on_cell> hC(h, partial);
   cuFvMappedField<Scalar, on_cell> culmulative_depth(culmulative_depth_host, mesh_ptr_dev);
   cuFvMappedField<Scalar, on_cell> hydraulic_conductivity(hydraulic_conductivity_host, mesh_ptr_dev);
   cuFvMappedField<Scalar, on_cell> capillary_head(capillary_head_host, mesh_ptr_dev);
@@ -204,6 +210,7 @@ int run(const char* work_dir){
   cuGaugesWriter<Scalar, on_cell> h_writer(fvMeshQueries(mesh), h, "input/field/gauges_pos.dat", "output/h_gauges.dat");
   cuGaugesWriter<Scalar, on_cell> eta_writer(fvMeshQueries(mesh), eta, "input/field/gauges_pos.dat", "output/eta_gauges.dat");
   cuGaugesWriter<Vector, on_cell> hU_writer(fvMeshQueries(mesh), hU, "input/field/gauges_pos.dat", "output/hU_gauges.dat");
+  cuGaugesWriter<Scalar, on_cell> C_writer(fvMeshQueries(mesh), C, "input/field/gauges_pos.dat", "output/C_gauges.dat");
 
   //precipitation
   cuFvMappedField<Scalar, on_cell> precipitation(precipitation_host, mesh_ptr_dev);
@@ -211,6 +218,8 @@ int run(const char* work_dir){
   //advections
   cuFvMappedField<Scalar, on_cell> h_advection(h, partial);
   cuFvMappedField<Vector, on_cell> hU_advection(hU, partial);
+  //tracer advection (T2 rider)
+  cuFvMappedField<Scalar, on_cell> hC_advection(hC, partial);
 
   //gradient
   cuFvMappedField<Vector, on_cell> z_gradient(hU, partial);
@@ -228,6 +237,10 @@ int run(const char* work_dir){
   h.update_boundary_values();
   hU.update_time(time_controller.current(), 0.0);
   hU.update_boundary_values();
+  //T2 tracer: set C boundary to current time, then initialise hC = h*C
+  C.update_time(time_controller.current(), 0.0);
+  C.update_boundary_values();
+  fv::cuBinary(h, C, hC, [] __device__(Scalar& a, Scalar& b) -> Scalar{ return a*b; });
 
   //ascii raster writer
   cuGisAsciiWriter raster_writer("input/mesh/DEM.txt");
@@ -277,6 +290,7 @@ int run(const char* work_dir){
 
   h.update_boundary_source("input/field/", "h");
   hU.update_boundary_source("input/field/", "hU");
+  C.update_boundary_source("input/field/", "C");
 
   //Main loop
   do{
@@ -289,9 +303,16 @@ int run(const char* work_dir){
     //calculate advection
     fv::cuAdvectionMSWEsCartesian(gravity, h, z, z_gradient, hU, h_advection, hU_advection); //SRM
 
+    //T2 passive tracer: hC advection reuses the SAME interface mass flux as the line above
+    //(h/hU numerical path untouched). hC_flux = mass_flux * c_upwind.
+    fv::cuAdvectionScalarRiderCartesian(gravity, h, z, z_gradient, hU, C, hC, hC_advection);
+
     //multiply advection with -1
     fv::cuUnaryOn(h_advection, [] __device__ (Scalar& a) -> Scalar{return -1.0*a;});
     fv::cuUnaryOn(hU_advection, [] __device__ (Vector& a) -> Vector{return -1.0*a;});
+    fv::cuUnaryOn(hC_advection, [] __device__ (Scalar& a) -> Scalar{return -1.0*a;});
+    //tracer Euler step (same dt as h; both advections taken from start-of-step state)
+    fv::cuEulerIntegrator(hC, hC_advection, time_controller.dt(), time_controller.current());
 
     //integration
     fv::cuFrictionManningImplicit(time_controller.dt(), gravity, manning_coef, h, hU, hU_advection);
@@ -307,6 +328,13 @@ int run(const char* work_dir){
     fv::cuTotalSourceSink(h, hU, hydraulic_conductivity, capillary_head, water_content_diff, culmulative_depth, precipitation, sewer_sink, time_controller.dt());
     h.update_time(time_controller.current(), time_controller.dt());
     h.update_boundary_values();
+
+    //T2 R5: source/sink changed h (hC untouched = pure-water source/sink). Recompute C = hC/h (dry->0)
+    //for output/boundary/next-step, then re-derive hC = h*C (round-trip; also zeros dry-cell hC).
+    fv::cuBinary(hC, h, C, [] __device__(Scalar& a, Scalar& b) -> Scalar{ return b >= (Scalar)1e-10 ? a / b : (Scalar)0.0; });
+    C.update_time(time_controller.current(), time_controller.dt());
+    C.update_boundary_values();
+    fv::cuBinary(h, C, hC, [] __device__(Scalar& a, Scalar& b) -> Scalar{ return a*b; });
 
     //update maximum depth
     fv::cuBinary(h_max, h, h_max, [] __device__(Scalar& a, Scalar b) -> Scalar{ return fmax(a, b); });
@@ -335,6 +363,7 @@ int run(const char* work_dir){
       h_writer.write(time_controller.current());
       eta_writer.write(time_controller.current());
 	    hU_writer.write(time_controller.current());
+      C_writer.write(time_controller.current());
     }
 
     //print current time
@@ -345,6 +374,8 @@ int run(const char* work_dir){
 
 
     fv::cuBinaryOn(hU, h, momentum_filter);
+    //T2 R5: momentum_filter 同款对 hC 清零 (干格 h<=1e-10 -> hC=0), 防虚假浓度
+    fv::cuBinaryOn(hC, h, [] __device__(Scalar& a, Scalar& b) -> Scalar{ return b <= (Scalar)1e-10 ? (Scalar)0.0 : a; });
 
 
     cudaEventRecord(stop);
@@ -361,6 +392,7 @@ int run(const char* work_dir){
       raster_writer.write(h, "h", t_out);
       raster_writer.write(hUx, "hUx", t_out);
       raster_writer.write(hUy, "hUy", t_out);
+      raster_writer.write(C, "C", t_out);
       t_out += dt_out;
     }
     
@@ -369,6 +401,7 @@ int run(const char* work_dir){
       std::cout << "Writing backup files" << std::endl;
       cuBackupWriter(h, "h_backup_", backup_time);
       cuBackupWriter(hU, "hU_backup_", backup_time);
+      cuBackupWriter(C, "C_backup_", backup_time);
       backup_time += backup_interval;
     }
 
@@ -578,6 +611,10 @@ void single_run(cuDataBank& bank, std::vector<int> device_list, unsigned int dom
     fv::cuBinary(h, z, eta, [] __device__ (Scalar& a, Scalar& b) -> Scalar{return a + b;});
 
     //calculate advection
+    // TODO(T2): passive tracer C/hC NOT wired in the multi-GPU path. T2 is single-GPU only
+    //   (run() above). Wiring here additionally requires halo exchange of C/hC via
+    //   CollectAndSend/ReceiveAndDispatch (multi-GPU red line — left intentionally unwired,
+    //   not half-wired). See T2_wiring_plan.md.
     fv::cuAdvectionMSWEsCartesian(gravity, h, z, z_gradient, hU, h_advection, hU_advection);
 
     //multiply advection with -1
@@ -588,7 +625,7 @@ void single_run(cuDataBank& bank, std::vector<int> device_list, unsigned int dom
     fv::cuFrictionManningImplicit(time_controller.dt(), gravity, manning_coef, h, hU, hU_advection);
     hU.update_time(time_controller.current(), time_controller.dt());
     hU.update_boundary_values();
-    fv::cuEulerIntegrator(h, h_advection, time_controller.dt(), time_controller.current());    
+    fv::cuEulerIntegrator(h, h_advection, time_controller.dt(), time_controller.current());
 
     //precipitation
     precipitation.update_time(time_controller.current(), 0.0);
