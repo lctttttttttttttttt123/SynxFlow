@@ -483,6 +483,9 @@ class InputModel:
                 self.write_gauges_position()
             else:
                 raise ValueError(one_file+' is not recognized')
+        # T5: write sediment_setup.dat when sediment groups were defined
+        if (file_tag is None or file_tag == 'all') and getattr(self, '_sediment_groups', None):
+            self._write_sediment_setup()
 
     def write_grid_files(self, file_tag, is_single_gpu=False):
         """Write grid-based files
@@ -504,6 +507,44 @@ class InputModel:
         readme_filename = os.path.join(self._case_folder,'readme.txt')
         self.Summary.to_json(readme_filename)
         print(file_tag+' created')
+
+    def set_sediment_groups(self, groups, morphology_on=False):
+        """T5 pluggable sediment framework: define N cohesive-sediment groups.
+
+        Args:
+            groups: list of dict; per group keys: settling_id, closure_id, cohesive,
+                rho_s, porosity, D50, w_s, tau_ce, tau_cd, M; optional 'C0' = initial
+                concentration (scalar or DEM-shaped array, default 0).
+            morphology_on: extension-point flag (default False; T5 never applies Δz_accum).
+
+        Numbers are example/placeholder inputs, written verbatim to
+        input/sediment_setup.dat; the solver reads them (NO value hard-coded in kernel).
+        Per-group initial concentration is written as grid file C0, C1, ... (reuses 'C' mechanism).
+        """
+        self._sediment_groups = groups
+        self._morphology_on = bool(morphology_on)
+        for k, g in enumerate(groups):
+            tag = 'C%d' % k
+            if tag not in InputModel.__grid_files:
+                InputModel.__grid_files.append(tag)
+                InputModel._file_tag_list.append(tag)
+            self.attributes[tag] = g.get('C0', 0)
+
+    def _write_sediment_setup(self):
+        """Write input/sediment_setup.dat (sectioned key=value), read by C++ read_sediment_setup()."""
+        input_dir = os.path.dirname(self._data_folders['field'])
+        path = os.path.join(input_dir, 'sediment_setup.dat')
+        keys = ['settling_id', 'closure_id', 'cohesive', 'rho_s', 'porosity',
+                'D50', 'w_s', 'tau_ce', 'tau_cd', 'M']
+        with open(path, 'w') as f:
+            f.write('$n_groups\n%d\n' % len(self._sediment_groups))
+            f.write('$morphology_on\n%d\n' % (1 if self._morphology_on else 0))
+            for k, g in enumerate(self._sediment_groups):
+                f.write('$group %d\n' % k)
+                for key in keys:
+                    if key in g:
+                        f.write('%s %s\n' % (key, g[key]))
+        print('sediment_setup.dat created (%d groups)' % len(self._sediment_groups))
 
     def write_boundary_conditions(self):
         """ Write boundary condtion files
