@@ -61,10 +61,13 @@ namespace GC{
     ///A fast 1st order surface reconstruction method for SWEs on Cartesian grids only
     void cuAdvectionMSWEsCartesian(cuFvMappedField<Scalar, on_cell>& gravity, cuFvMappedField<Scalar, on_cell>& h, cuFvMappedField<Scalar, on_cell>& z, cuFvMappedField<Vector, on_cell>& z_gradient, cuFvMappedField<Vector, on_cell>& hU, cuFvMappedField<Scalar, on_cell>& h_advection, cuFvMappedField<Vector, on_cell>& hU_advection);
 
-    ///T2 passive conservative tracer "rider": reuses cuAdvectionMSWEsCartesian reconstruction + the same
-    ///cuHLLCRiemannSolverSWEs mass flux; outputs ONLY hC_advection (hC_flux = mass_flux * c_upwind).
-    ///flood h/hU stays on cuAdvectionMSWEsCartesian (untouched). C供边界浓度(C.boundary_value), hC为守恒态。
-    void cuAdvectionScalarRiderCartesian(cuFvMappedField<Scalar, on_cell>& gravity, cuFvMappedField<Scalar, on_cell>& h, cuFvMappedField<Scalar, on_cell>& z, cuFvMappedField<Vector, on_cell>& z_gradient, cuFvMappedField<Vector, on_cell>& hU, cuFvMappedField<Scalar, on_cell>& C, cuFvMappedField<Scalar, on_cell>& hC, cuFvMappedField<Scalar, on_cell>& hC_advection);
+    ///Same as cuAdvectionMSWEsCartesian but ALSO exports per-face interface mass flux into h_flux_cache
+    ///(size 4*ncells, layout [i*cell_neighbours_length + index]). h/hU output is byte-identical.
+    void cuAdvectionMSWEsCartesianCacheFlux(cuFvMappedField<Scalar, on_cell>& gravity, cuFvMappedField<Scalar, on_cell>& h, cuFvMappedField<Scalar, on_cell>& z, cuFvMappedField<Vector, on_cell>& z_gradient, cuFvMappedField<Vector, on_cell>& hU, cuFvMappedField<Scalar, on_cell>& h_advection, cuFvMappedField<Vector, on_cell>& hU_advection, Scalar* h_flux_cache);
+
+    ///T2 passive conservative tracer "rider" (route 甲-正): reuses flood's cached interface mass flux
+    ///(h_flux_cache) for a 1st-order upwind hC update; NO reconstruction/Riemann recompute. flood h/hU untouched.
+    void cuTransportScalarRiderCached(cuFvMappedField<Scalar, on_cell>& C, cuFvMappedField<Scalar, on_cell>& hC, cuFvMappedField<Scalar, on_cell>& h, Scalar* h_flux_cache, cuFvMappedField<Scalar, on_cell>& hC_advection);
 
     ///A fast 1st order surface reconstruction method for non-hydrostatic SWEs on Cartesian grids only
     void cuAdvectionNSWEsSRMCartesian(cuFvMappedField<Scalar, on_cell>& gravity, cuFvMappedField<Scalar, on_cell>& centrifugal, cuFvMappedField<Scalar, on_cell>& h, cuFvMappedField<Scalar, on_cell>& z, cuFvMappedField<Vector, on_cell>& z_gradient, cuFvMappedField<Vector, on_cell>& hU, cuFvMappedField<Scalar, on_cell>& h_advection, cuFvMappedField<Vector, on_cell>& hU_advection);

@@ -8,13 +8,17 @@
 **选定路线甲**: flood 原 `cuAdvectionMSWEsCartesian` 调用一字不动 (流场字节级不变, 无需重跑 T1d);
 新增**只算 hC_advection 的兄弟算子** `cuAdvectionScalarRiderCartesian`, 复用 flood 重构 + 字节相同 Riemann, 仅输出改为 `hC_flux=_h_flux*c_upwind`。
 
-**约束 1 — 复用名副其实 + 同步义务 (防漂移)**:
-- 兄弟算子的 **Riemann 直接调用 flood 同一个 `cuHLLCRiemannSolverSWEs`** (单一来源, 不复制 Riemann 数学)。
-- 重构部分 (eta/h/u 的 L/R 与 z_f/dz/deta) **逐行复制自 `cuAdvectionMSWEsCartesianKernel`** (`cuda_advection_NSWEs.cu` 原 L836-943),
-  因避红线6 (不重写已验证算子) 故不抽公共函数 (抽取需改 flood 原 kernel)。
-- **同步义务 (写进 kernel 注释 + commit 信息)**: "本 kernel 重构段复制自 cuAdvectionMSWEsCartesianKernel;
-  仅输出改为 hC_advection (hC_flux=_h_flux*c_upwind)。**若 flood 原平流算子的重构/Riemann 改动, 必须同步本 kernel**。"
-- 兄弟算子置于 `cuda_advection_NSWEs.{cu,h}` (紧邻原算子, 便于同步; 该 TU 已 include `cuda_riemann_solvers.cuh`, 可直接用 flood Riemann; lib 已编, 不改 CMake)。**不动** flood 原 `cuAdvectionMSWEsCartesian*`。
+**约束 1 — 复用名副其实 (甲-正: 缓存通量, 非重算)**:
+> 修订 (2026-06-14, 用户裁定): 初版兄弟算子**复制重构+重跑 Riemann** 取通量 → case_90 实测 +48% 墙钟, 属**实现走样**
+> (开销来自重算, 非"流场零风险")。正解 = 缓存 flood 已算的界面质量通量, 不重算。
+- **flood 主 kernel `cuAdvectionMSWEsCartesianKernel` 每步本就算出 `_h_flux` (界面质量通量) 用于更新 h**;
+  给它加一个**可选输出参数 `h_flux_cache`** (size 4*ncells, layout `[i*cell_neighbours_length+index]`),
+  把 `_h_flux` 落出 (双干面写 0)。**这是"读出中间量", h/hU 的任何算术一字未改** (字节级 diff 验证; 不触红线6)。
+- 兄弟 rider `cuTransportScalarRiderCached`: 直接读 `h_flux_cache` 做 `_hC_flux = _h_flux*c_upwind`, **不重跑 reconstruction/Riemann**。
+  开销 ≈ 一个 4*ncells 通量数组的显存 + 一次缓存读 + 迎风累加 → 个位数 %。
+- flood 原 `cuAdvectionMSWEsCartesian` 7-参版**保留** (多 GPU single_run 用, 内部传 nullptr, 行为不变);
+  新增 `cuAdvectionMSWEsCartesianCacheFlux` (传 cache) 供单 GPU run()。
+- **同步义务**: rider 与 flood 平流共用同一 `h_flux_cache` → 天然同通量, 无需手工对齐重构。仅依赖主 kernel 的 `[flux-cache]` 落出行。
 
 **约束 2 — 字节级旁证 (比 C≡1 更早抓意外改动)**:
 - 接线编译后, 对 `case_90_n020` 跑一发: 因甲不动 h/hU, **h_max/gauge 必须与接线前逐位一致 (diff 全 0 字节级, 不是阈内)**;

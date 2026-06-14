@@ -220,6 +220,8 @@ int run(const char* work_dir){
   cuFvMappedField<Vector, on_cell> hU_advection(hU, partial);
   //tracer advection (T2 rider)
   cuFvMappedField<Scalar, on_cell> hC_advection(hC, partial);
+  //per-face interface mass flux cache (4 per cell, layout [i*ncells+index]); flood 主平流落出, 示踪复用
+  cuArray<Scalar> h_flux_cache(4 * h.data.size());
 
   //gradient
   cuFvMappedField<Vector, on_cell> z_gradient(hU, partial);
@@ -300,12 +302,12 @@ int run(const char* work_dir){
     //calculate the surface elevation
     fv::cuBinary(h, z, eta, [] __device__ (Scalar& a, Scalar& b) -> Scalar{return a + b;});
 
-    //calculate advection
-    fv::cuAdvectionMSWEsCartesian(gravity, h, z, z_gradient, hU, h_advection, hU_advection); //SRM
+    //calculate advection (also exports per-face mass flux into h_flux_cache; h/hU output identical)
+    fv::cuAdvectionMSWEsCartesianCacheFlux(gravity, h, z, z_gradient, hU, h_advection, hU_advection, h_flux_cache.dev_ptr()); //SRM
 
-    //T2 passive tracer: hC advection reuses the SAME interface mass flux as the line above
-    //(h/hU numerical path untouched). hC_flux = mass_flux * c_upwind.
-    fv::cuAdvectionScalarRiderCartesian(gravity, h, z, z_gradient, hU, C, hC, hC_advection);
+    //T2 passive tracer (route 甲-正): hC advection REUSES flood's cached interface mass flux
+    //(no reconstruction/Riemann recompute). hC_flux = cached_mass_flux * c_upwind.
+    fv::cuTransportScalarRiderCached(C, hC, h, h_flux_cache.dev_ptr(), hC_advection);
 
     //multiply advection with -1
     fv::cuUnaryOn(h_advection, [] __device__ (Scalar& a) -> Scalar{return -1.0*a;});

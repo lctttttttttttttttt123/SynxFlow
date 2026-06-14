@@ -833,7 +833,12 @@ namespace GC{
     }
 
 
-    __global__ void cuAdvectionMSWEsCartesianKernel(Scalar* gravity, Scalar* h, Scalar* _h_bound, Scalar* z, Scalar* _z_bound, Vector* z_gradient, Vector* hU, Vector* _hU_bound, unsigned int phi_size, ShortDualHandle* cell_neigbours, unsigned int cell_neighbours_length, Scalar* cell_volume, Scalar* h_advection, Vector* hU_advection){
+    // h_flux_cache (optional, nullable): if non-null, the per-face interface mass flux _h_flux
+    // is written to h_flux_cache[i*cell_neighbours_length + index] (0 for double-dry skipped faces).
+    // This is purely an EXTRA OUTPUT of an existing intermediate value — the h/hU arithmetic below
+    // is byte-for-byte unchanged (verified by case_90 byte-level diff). Used by the T2 passive
+    // tracer rider to reuse flood's mass flux instead of recomputing reconstruction+Riemann.
+    __global__ void cuAdvectionMSWEsCartesianKernel(Scalar* gravity, Scalar* h, Scalar* _h_bound, Scalar* z, Scalar* _z_bound, Vector* z_gradient, Vector* hU, Vector* _hU_bound, unsigned int phi_size, ShortDualHandle* cell_neigbours, unsigned int cell_neighbours_length, Scalar* cell_volume, Scalar* h_advection, Vector* hU_advection, Scalar* h_flux_cache){
 
       unsigned int index = blockDim.x * blockIdx.x + threadIdx.x;
       Scalar h_small = 1e-10;
@@ -891,6 +896,7 @@ namespace GC{
             hU_neib = _hU_bound[id_boundary];
           }
           if (h_this < h_small && h_neib < h_small){
+            if (h_flux_cache) h_flux_cache[i*cell_neighbours_length + index] = (Scalar)0.0;   // [flux-cache] double-dry face: 0
             continue;
           }
           Scalar eta_neib = z_neib + h_neib;
@@ -923,6 +929,7 @@ namespace GC{
           Scalar g = 0.5*(g_this + g_neib);
           auto flux = cuHLLCRiemannSolverSWEs(g, ScalarRiemannState(h_L, h_R), VectorRiemannState(h_L*u_L, h_R*u_R));
           Scalar _h_flux = flux.h;
+          if (h_flux_cache) h_flux_cache[i*cell_neighbours_length + index] = _h_flux;          // [flux-cache] export interface mass flux (no arithmetic change to h/hU)
           Vector2 _hU_flux = (flux.q.x*normal + flux.q.y*shear);
           if (h_neib < h_small){
             delta_z = fmax((Scalar)0.0, z_f - eta_this);
@@ -942,6 +949,7 @@ namespace GC{
       }
     }
 
+    // original wrapper (no flux cache) — used by multi-GPU single_run(), behaviour unchanged (passes nullptr)
     void cuAdvectionMSWEsCartesian(cuFvMappedField<Scalar, on_cell>& gravity, cuFvMappedField<Scalar, on_cell>& h, cuFvMappedField<Scalar, on_cell>& z, cuFvMappedField<Vector, on_cell>& z_gradient, cuFvMappedField<Vector, on_cell>& hU, cuFvMappedField<Scalar, on_cell>& h_advection, cuFvMappedField<Vector, on_cell>& hU_advection){
 
       auto mesh = h.mesh;
@@ -959,130 +967,17 @@ namespace GC{
         mesh->cell_neighbours.length(),
         mesh->cell_volumes.dev_ptr(),
         h_advection.data.dev_ptr(),
-        hU_advection.data.dev_ptr());
+        hU_advection.data.dev_ptr(),
+        nullptr);
     }
 
-    // =====================================================================================
-    // cuAdvectionScalarRiderCartesian — T2 被动守恒示踪 C 的“标量骑乘”算子 (路线甲)
-    // -------------------------------------------------------------------------------------
-    // 重构段【逐行复制自本文件 cuAdvectionMSWEsCartesianKernel】(见上方该 kernel), 复用同一个
-    // cuHLLCRiemannSolverSWEs (单一来源, 不复制 Riemann 数学)。唯一改动: 不输出 h/hU advection,
-    // 只取其界面质量通量 _h_flux 做 1st-order 迎风标量更新 _hC_flux = _h_flux*c_upwind,
-    // 输出 hC_advection。边界格示踪浓度直接取 C.boundary_value(_C_bound); 干格 c 强制 0。
-    //
-    // 【同步义务】flood 的 h/hU 仍走原 cuAdvectionMSWEsCartesian (不动); 本 kernel 必须与之用
-    // 同一套界面质量通量。**若 cuAdvectionMSWEsCartesianKernel 的重构/Riemann 改动, 必须同步本
-    // kernel**, 否则示踪平流与水动力平流漂移。(标注于 T2_wiring_plan.md 约束1)
-    // =====================================================================================
-    __global__ void cuAdvectionScalarRiderCartesianKernel(Scalar* gravity, Scalar* h, Scalar* _h_bound, Scalar* z, Scalar* _z_bound, Vector* z_gradient, Vector* hU, Vector* _hU_bound, Scalar* hC, Scalar* _C_bound, unsigned int phi_size, ShortDualHandle* cell_neigbours, unsigned int cell_neighbours_length, Scalar* cell_volume, Scalar* hC_advection){
-
-      unsigned int index = blockDim.x * blockIdx.x + threadIdx.x;
-      Scalar h_small = 1e-10;
-      Vector2 face_normal[4];
-      Vector2 face_shear[4];
-      face_normal[0] = Vector2(0.0, -1.0);
-      face_normal[1] = Vector2(1.0, 0.0);
-      face_normal[2] = Vector2(0.0, 1.0);
-      face_normal[3] = Vector2(-1.0, 0.0);
-      face_shear[0] = Vector2(1.0, 0.0);
-      face_shear[1] = Vector2(0.0, 1.0);
-      face_shear[2] = Vector2(-1.0, 0.0);
-      face_shear[3] = Vector2(0.0, -1.0);
-      while (index < phi_size){
-        Scalar g_this = gravity[index];
-        Scalar h_this = h[index];
-        Scalar z_this = z[index];
-        Vector2 _z_gradient_this = z_gradient[index];
-        Scalar eta_this = h_this + z_this;
-        Vector2 hU_this = hU[index];
-        Vector2 u_this = 0.0;
-        Scalar hC_this = hC[index];                 // [rider] tracer state
-        Scalar c_this = 0.0;                         // [rider]
-        if (h_this < h_small){
-          u_this = 0.0;
-          c_this = 0.0;                              // [rider] dry -> c=0
-        }
-        else{
-          u_this = hU_this / h_this;
-          c_this = hC_this / h_this;                 // [rider]
-        }
-        Scalar volume = cell_volume[index];
-        Scalar area = sqrt(volume);
-        Scalar _hC_advection(0.0);                   // [rider] only tracer advection
-        for (Flag i = 0; i < 4; ++i){
-          Vector2 normal = face_normal[i];
-          Vector2 shear = face_shear[i];
-          ShortDualHandle neib = cell_neigbours[i*cell_neighbours_length + index];
-          Scalar g_neib = 0.0;
-          Scalar h_neib = 0.0;
-          Scalar z_neib = 0.0;
-          Vector2 hU_neib = 0.0;
-          Vector2 _z_gradient_neib = 0.0;
-          Scalar c_neib = 0.0;                        // [rider]
-          if (!neib.is_boundary()){
-            Flag id_neib = neib.get_global_id();
-            g_neib = gravity[id_neib];
-            h_neib = h[id_neib];
-            z_neib = z[id_neib];
-            hU_neib = hU[id_neib];
-            _z_gradient_neib = z_gradient[id_neib];
-            c_neib = (h_neib < h_small) ? (Scalar)0.0 : hC[id_neib] / h_neib;        // [rider] interior c
-          }
-          else{
-            Flag id_boundary = neib.get_global_id();
-            g_neib = g_this;
-            h_neib = _h_bound[id_boundary];
-            z_neib = _z_bound[id_boundary];
-            hU_neib = _hU_bound[id_boundary];
-            c_neib = (h_neib < h_small) ? (Scalar)0.0 : _C_bound[id_boundary];        // [rider] boundary tracer conc (C.boundary_value)
-          }
-          if (h_this < h_small && h_neib < h_small){
-            continue;
-          }
-          Scalar eta_neib = z_neib + h_neib;
-          Vector2 u_neib = 0.0;
-          if (h_neib < h_small){
-            u_neib = 0.0;
-          }
-          else{
-            u_neib = hU_neib / h_neib;
-          }
-          Vector2 direction_this = 0.5*normal*area;
-          Vector2 direction_neib = -0.5*normal*area;
-          Scalar _z_this = z_this + dot(_z_gradient_this, direction_this);
-          Scalar _z_neib = z_neib + dot(_z_gradient_neib, direction_neib);
-          Scalar z_f = fmax(z_this, z_neib);
-          Scalar dz_clip = _z_neib - _z_this;
-          if (neib.is_boundary()){
-            dz_clip = 0.0;
-          }
-          Scalar dz = z_neib - z_this - dz_clip;
-          Scalar deta_this = fmax((Scalar)0.0, fmin(dz, eta_neib - eta_this));
-          Scalar deta_neib = fmax((Scalar)0.0, fmin(-dz, - eta_neib + eta_this));
-          Scalar eta_L = eta_this + deta_this;
-          Scalar eta_R = eta_neib + deta_neib;
-          Scalar h_L = fmax((Scalar)0.0, eta_L - z_f);
-          Scalar h_R = fmax((Scalar)0.0, eta_R - z_f);
-          Vector2 u_L(dot(u_this, normal), dot(u_this, shear));
-          Vector2 u_R(dot(u_neib, normal), dot(u_neib, shear));
-          Scalar g = 0.5*(g_this + g_neib);
-          // SAME Riemann + SAME inputs as cuAdvectionMSWEsCartesianKernel -> SAME mass flux
-          auto flux = cuHLLCRiemannSolverSWEs(g, ScalarRiemannState(h_L, h_R), VectorRiemannState(h_L*u_L, h_R*u_R));
-          Scalar _h_flux = flux.h;
-          Scalar _hC_flux = (_h_flux >= (Scalar)0.0) ? _h_flux*c_this : _h_flux*c_neib;   // [rider] 1st-order upwind
-          _hC_advection += _hC_flux*area / volume;                                        // [rider]
-        }
-        hC_advection[index] = _hC_advection;
-        __syncthreads();
-        index += blockDim.x * gridDim.x;
-      }
-    }
-
-    void cuAdvectionScalarRiderCartesian(cuFvMappedField<Scalar, on_cell>& gravity, cuFvMappedField<Scalar, on_cell>& h, cuFvMappedField<Scalar, on_cell>& z, cuFvMappedField<Vector, on_cell>& z_gradient, cuFvMappedField<Vector, on_cell>& hU, cuFvMappedField<Scalar, on_cell>& C, cuFvMappedField<Scalar, on_cell>& hC, cuFvMappedField<Scalar, on_cell>& hC_advection){
+    // T2 variant: same kernel, additionally exports per-face mass flux into h_flux_cache (size 4*ncells,
+    // layout [i*cell_neighbours_length + index]) for the passive-tracer rider. h/hU output identical.
+    void cuAdvectionMSWEsCartesianCacheFlux(cuFvMappedField<Scalar, on_cell>& gravity, cuFvMappedField<Scalar, on_cell>& h, cuFvMappedField<Scalar, on_cell>& z, cuFvMappedField<Vector, on_cell>& z_gradient, cuFvMappedField<Vector, on_cell>& hU, cuFvMappedField<Scalar, on_cell>& h_advection, cuFvMappedField<Vector, on_cell>& hU_advection, Scalar* h_flux_cache){
 
       auto mesh = h.mesh;
 
-      cuAdvectionScalarRiderCartesianKernel << <BLOCKS_PER_GRID, THREADS_PER_BLOCK >> >(gravity.data.dev_ptr(),
+      cuAdvectionMSWEsCartesianKernel << <BLOCKS_PER_GRID, THREADS_PER_BLOCK >> >(gravity.data.dev_ptr(),
         h.data.dev_ptr(),
         h.boundary_value.dev_ptr(),
         z.data.dev_ptr(),
@@ -1090,8 +985,71 @@ namespace GC{
         z_gradient.data.dev_ptr(),
         hU.data.dev_ptr(),
         hU.boundary_value.dev_ptr(),
+        h.data.size(),
+        mesh->cell_neighbours.dev_ptr(),
+        mesh->cell_neighbours.length(),
+        mesh->cell_volumes.dev_ptr(),
+        h_advection.data.dev_ptr(),
+        hU_advection.data.dev_ptr(),
+        h_flux_cache);
+    }
+
+    // =====================================================================================
+    // cuTransportScalarRiderCached — T2 被动守恒示踪 C (路线甲-正: 复用缓存的界面质量通量)
+    // -------------------------------------------------------------------------------------
+    // 直接读 cuAdvectionMSWEsCartesianKernel 落出的 h_flux_cache (每界面 _h_flux = flood 用于更新 h
+    // 的同一界面质量通量, layout [i*cell_neighbours_length + index]), 做 1st-order 迎风
+    // _hC_flux = _h_flux * c_upwind 并累加 hC_advection。**不重算 reconstruction/Riemann** ——
+    // 这才是计划"复用其质量通量"的字面实现 (开销 ~ 一次缓存读 + 迎风累加, 个位数 %)。
+    // 边界格示踪浓度取 C.boundary_value(_C_bound); 干格 c 强制 0。h/hU 仍由 flood 原算子负责。
+    //
+    // 【同步义务】本 rider 与 flood 平流共用 h_flux_cache; 二者天然同通量, 无需再手工对齐重构。
+    // 仅依赖 cuAdvectionMSWEsCartesianKernel 把 _h_flux 落进 cache (见该 kernel 的 [flux-cache] 行)。
+    // =====================================================================================
+    __global__ void cuTransportScalarRiderCachedKernel(Scalar* h, Scalar* _h_bound, Scalar* hC, Scalar* _C_bound, Scalar* h_flux_cache, unsigned int phi_size, ShortDualHandle* cell_neigbours, unsigned int cell_neighbours_length, Scalar* cell_volume, Scalar* hC_advection){
+
+      unsigned int index = blockDim.x * blockIdx.x + threadIdx.x;
+      Scalar h_small = 1e-10;
+      while (index < phi_size){
+        Scalar h_this = h[index];
+        Scalar hC_this = hC[index];
+        Scalar c_this = (h_this < h_small) ? (Scalar)0.0 : hC_this / h_this;   // dry -> c=0
+        Scalar volume = cell_volume[index];
+        Scalar area = sqrt(volume);
+        Scalar _hC_advection(0.0);
+        for (Flag i = 0; i < 4; ++i){
+          ShortDualHandle neib = cell_neigbours[i*cell_neighbours_length + index];
+          Scalar _h_flux = h_flux_cache[i*cell_neighbours_length + index];      // reuse flood's interface mass flux
+          Scalar c_neib = 0.0;
+          if (!neib.is_boundary()){
+            Flag id_neib = neib.get_global_id();
+            Scalar h_neib = h[id_neib];
+            c_neib = (h_neib < h_small) ? (Scalar)0.0 : hC[id_neib] / h_neib;
+          }
+          else{
+            Flag id_boundary = neib.get_global_id();
+            Scalar h_neib = _h_bound[id_boundary];
+            c_neib = (h_neib < h_small) ? (Scalar)0.0 : _C_bound[id_boundary];  // boundary tracer conc
+          }
+          Scalar _hC_flux = (_h_flux >= (Scalar)0.0) ? _h_flux*c_this : _h_flux*c_neib;   // 1st-order upwind
+          _hC_advection += _hC_flux*area / volume;
+        }
+        hC_advection[index] = _hC_advection;
+        __syncthreads();
+        index += blockDim.x * gridDim.x;
+      }
+    }
+
+    void cuTransportScalarRiderCached(cuFvMappedField<Scalar, on_cell>& C, cuFvMappedField<Scalar, on_cell>& hC, cuFvMappedField<Scalar, on_cell>& h, Scalar* h_flux_cache, cuFvMappedField<Scalar, on_cell>& hC_advection){
+
+      auto mesh = h.mesh;
+
+      cuTransportScalarRiderCachedKernel << <BLOCKS_PER_GRID, THREADS_PER_BLOCK >> >(
+        h.data.dev_ptr(),
+        h.boundary_value.dev_ptr(),
         hC.data.dev_ptr(),
         C.boundary_value.dev_ptr(),
+        h_flux_cache,
         h.data.size(),
         mesh->cell_neighbours.dev_ptr(),
         mesh->cell_neighbours.length(),
