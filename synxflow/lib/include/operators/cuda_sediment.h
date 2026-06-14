@@ -21,6 +21,11 @@
 
 namespace GC {
 
+  // Compile-time upper bound on sediment groups (sizes the WithSediment kernel's per-cell stack
+  // arrays). Runtime n_sed must be <= this; the flood solver guards it. Raise + rebuild for more
+  // grain-size classes (only the n_sed>0 WithSediment kernel pays the register/stack cost).
+  static const int SED_MAX_GROUPS = 8;
+
   // -------- per-group parameters (POD; usable on host & device) --------
   // All values come from input/sediment_setup.dat. Defaults are literature PLACEHOLDERS
   // (so a missing key is sane), NOT modelling decisions — real values go in the config file.
@@ -35,6 +40,7 @@ namespace GC {
     Scalar tau_ce      = 0.0;    // critical shear for erosion [Pa]
     Scalar tau_cd      = 0.0;    // critical shear for deposition [Pa]
     Scalar M           = 0.0;    // Partheniades erosion coefficient [kg/m2/s]
+    Scalar bed_init    = 0.0;    // initial erodible bed mass store [kg/m2] (uniform seed; 0=no bed)
   };
 
   struct SedimentConfig {
@@ -72,12 +78,27 @@ namespace GC {
         else if (key == "tau_ce")      ss >> p.tau_ce;
         else if (key == "tau_cd")      ss >> p.tau_cd;
         else if (key == "M")           ss >> p.M;
+        else if (key == "bed_init")    ss >> p.bed_init;
         // unknown keys ignored (forward-compatible)
       }
     }
     (void)declared;   // $n_groups is a hint; actual count = number of $group sections parsed
     return cfg;
   }
+
+  namespace fv {
+    // T5 step3 operators (defined in src/operators/cuda_sediment.cu). WithSediment path only.
+    // tau_b = rho_w*g*n^2*|u|^2/h^(1/3) ; dry cell -> 0.
+    void cuSedimentBedShear(cuFvMappedField<Scalar, on_cell>& manning, cuFvMappedField<Scalar, on_cell>& gravity,
+                            cuFvMappedField<Scalar, on_cell>& h, cuFvMappedField<Vector, on_cell>& hU,
+                            cuFvMappedField<Scalar, on_cell>& tau_b);
+    // Per-group E-D reaction on top of advection: hC_k += ED*dt, bed_k -= ED*dt (R5-clamped),
+    // dz_accum += (-ED*dt)/(rho_s*(1-porosity)) COMPUTED-but-unapplied (z never touched in T5).
+    // params_dev = device array of n_sed SedimentParams; hCs_dev/beds_dev = device Scalar* arrays.
+    void cuSedimentErosionDeposition(cuFvMappedField<Scalar, on_cell>& h, cuFvMappedField<Scalar, on_cell>& tau_b,
+                                     Scalar** hCs_dev, Scalar** beds_dev, Scalar* dz_accum_dev,
+                                     SedimentParams* params_dev, int n_sed, Scalar dt);
+  }  // namespace fv
 
 }  // namespace GC
 

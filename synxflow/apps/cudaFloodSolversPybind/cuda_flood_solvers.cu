@@ -174,6 +174,11 @@ int run(const char* work_dir){
   //  step 2 only uses n_sed (advection generalisation); per-group params (w_s/tau_*/M) drive E-D in step 3.
   SedimentConfig sed_cfg = read_sediment_setup("input/sediment_setup.dat");
   const int n_sed = sed_cfg.n_groups();
+  if (n_sed > SED_MAX_GROUPS){   //T5: WithSediment kernel stack arrays sized SED_MAX_GROUPS; refuse silent overflow
+    std::cerr << "ERROR: sediment groups (" << n_sed << ") exceed compile-time SED_MAX_GROUPS ("
+              << SED_MAX_GROUPS << "). Raise SED_MAX_GROUPS in cuda_sediment.h and rebuild." << std::endl;
+    return -1;
+  }
   //per-group initial concentration host fields C0,C1,... (registered by InputModel.set_sediment_groups)
   std::vector<std::shared_ptr<fvScalarFieldOnCell>> Csed_host;
   for (int k = 0; k < n_sed; ++k){
@@ -208,12 +213,19 @@ int run(const char* work_dir){
   cuFvMappedField<Scalar, on_cell> hC(h, partial);
   //T5: per-group device fields — concentration C_k, conserved hC_k = h*C_k, advection rider hC_k_adv.
   //  shared_ptr so the vector owns stable device buffers (no copy/realloc of cuFvMappedField).
-  std::vector<std::shared_ptr<cuFvMappedField<Scalar, on_cell>>> Csed, hCsed, hCsed_adv;
+  std::vector<std::shared_ptr<cuFvMappedField<Scalar, on_cell>>> Csed, hCsed, hCsed_adv, bed;
   for (int k = 0; k < n_sed; ++k){
     Csed.push_back(std::make_shared<cuFvMappedField<Scalar, on_cell>>(*Csed_host[k], mesh_ptr_dev));
     hCsed.push_back(std::make_shared<cuFvMappedField<Scalar, on_cell>>(h, partial));
     hCsed_adv.push_back(std::make_shared<cuFvMappedField<Scalar, on_cell>>(h, partial));
+    bed.push_back(std::make_shared<cuFvMappedField<Scalar, on_cell>>(h, partial));   //T5 step3: bed mass store [kg/m2]
+    Scalar bed0 = sed_cfg.groups[k].bed_init;                                          // uniform initial bed seed (config; 0 default)
+    fv::cuUnaryOn(*bed[k], [bed0] __device__(Scalar& a) -> Scalar{ return bed0; });
   }
+  //T5 step3: bed shear stress tau_b [Pa] + accumulated (unapplied) bed-elevation change Delta-z [m]
+  cuFvMappedField<Scalar, on_cell> tau_b(h, partial);
+  cuFvMappedField<Scalar, on_cell> dz_accum(h, partial);
+  if (n_sed > 0) fv::cuUnaryOn(dz_accum, [] __device__(Scalar& a) -> Scalar{ return (Scalar)0.0; });
   cuFvMappedField<Scalar, on_cell> culmulative_depth(culmulative_depth_host, mesh_ptr_dev);
   cuFvMappedField<Scalar, on_cell> hydraulic_conductivity(hydraulic_conductivity_host, mesh_ptr_dev);
   cuFvMappedField<Scalar, on_cell> capillary_head(capillary_head_host, mesh_ptr_dev);
@@ -269,9 +281,10 @@ int run(const char* work_dir){
 
   //T5: per-group boundary @ t0, init hC_k = h*C_k, then assemble device Scalar** pointer arrays
   //  (dev_ptr() of data/boundary buffers is stable for the run -> assemble once).
-  Scalar **hCs_dev = nullptr, **Csbound_dev = nullptr, **hCs_adv_dev = nullptr;
+  Scalar **hCs_dev = nullptr, **Csbound_dev = nullptr, **hCs_adv_dev = nullptr, **beds_dev = nullptr;
+  SedimentParams *params_dev = nullptr;   //T5 step3: per-group params on device (E-D closures read these)
   if (n_sed > 0){
-    std::vector<Scalar*> hCs_host(n_sed), Csbound_host(n_sed), hCs_adv_host(n_sed);
+    std::vector<Scalar*> hCs_host(n_sed), Csbound_host(n_sed), hCs_adv_host(n_sed), beds_host(n_sed);
     for (int k = 0; k < n_sed; ++k){
       Csed[k]->update_time(time_controller.current(), 0.0);
       Csed[k]->update_boundary_values();
@@ -279,13 +292,18 @@ int run(const char* work_dir){
       hCs_host[k]     = hCsed[k]->data.dev_ptr();
       Csbound_host[k] = Csed[k]->boundary_value.dev_ptr();
       hCs_adv_host[k] = hCsed_adv[k]->data.dev_ptr();
+      beds_host[k]    = bed[k]->data.dev_ptr();
     }
     checkCuda(cudaMalloc(&hCs_dev,     n_sed * sizeof(Scalar*)));
     checkCuda(cudaMalloc(&Csbound_dev, n_sed * sizeof(Scalar*)));
     checkCuda(cudaMalloc(&hCs_adv_dev, n_sed * sizeof(Scalar*)));
+    checkCuda(cudaMalloc(&beds_dev,    n_sed * sizeof(Scalar*)));
+    checkCuda(cudaMalloc(&params_dev,  n_sed * sizeof(SedimentParams)));
     checkCuda(cudaMemcpy(hCs_dev,     hCs_host.data(),     n_sed * sizeof(Scalar*), cudaMemcpyHostToDevice));
     checkCuda(cudaMemcpy(Csbound_dev, Csbound_host.data(), n_sed * sizeof(Scalar*), cudaMemcpyHostToDevice));
     checkCuda(cudaMemcpy(hCs_adv_dev, hCs_adv_host.data(), n_sed * sizeof(Scalar*), cudaMemcpyHostToDevice));
+    checkCuda(cudaMemcpy(beds_dev,    beds_host.data(),    n_sed * sizeof(Scalar*), cudaMemcpyHostToDevice));
+    checkCuda(cudaMemcpy(params_dev,  sed_cfg.groups.data(), n_sed * sizeof(SedimentParams), cudaMemcpyHostToDevice));
   }
 
   //ascii raster writer
@@ -391,6 +409,14 @@ int run(const char* work_dir){
     fv::cuBinary(hC, h, C, [] __device__(Scalar& a, Scalar& b) -> Scalar{ return b >= (Scalar)1e-10 ? a / b : (Scalar)0.0; });
     C.update_time(time_controller.current(), time_controller.dt());
     C.update_boundary_values();
+    //T5 step3: E-D source/sink on the advected hC_k (WithSediment path only — n_sed=0 NEVER reaches here).
+    //  tau_b from current Manning friction + velocity; per-group erosion/deposition with R5 positivity;
+    //  bed_k store conserves mass; Delta-z_accum computed but NOT applied to z (§4 morphology extension point).
+    if (n_sed > 0){
+      fv::cuSedimentBedShear(manning_coef, gravity, h, hU, tau_b);
+      fv::cuSedimentErosionDeposition(h, tau_b, hCs_dev, beds_dev, dz_accum.data.dev_ptr(), params_dev, n_sed, time_controller.dt());
+    }
+
     //T5 R5: per-group recompute C_k = hC_k/h (dry->0) for output + next-step boundary upwind
     for (int k = 0; k < n_sed; ++k){
       fv::cuBinary(*hCsed[k], h, *Csed[k], [] __device__(Scalar& a, Scalar& b) -> Scalar{ return b >= (Scalar)1e-10 ? a / b : (Scalar)0.0; });
@@ -458,10 +484,13 @@ int run(const char* work_dir){
       raster_writer.write(hUx, "hUx", t_out);
       raster_writer.write(hUy, "hUy", t_out);
       raster_writer.write(C, "C", t_out);
-      for (int k = 0; k < n_sed; ++k){                    //T5: per-group concentration raster
+      for (int k = 0; k < n_sed; ++k){                    //T5: per-group concentration + bed-store raster
         std::string nm = "C" + std::to_string(k);
         raster_writer.write(*Csed[k], nm.c_str(), t_out);
+        std::string bnm = "bed" + std::to_string(k);
+        raster_writer.write(*bed[k], bnm.c_str(), t_out);
       }
+      if (n_sed > 0) raster_writer.write(dz_accum, "dz_accum", t_out);  //T5 §4: computed, NOT applied to z
       t_out += dt_out;
     }
     
@@ -481,6 +510,8 @@ int run(const char* work_dir){
   if (hCs_dev)     cudaFree(hCs_dev);
   if (Csbound_dev) cudaFree(Csbound_dev);
   if (hCs_adv_dev) cudaFree(hCs_adv_dev);
+  if (beds_dev)    cudaFree(beds_dev);
+  if (params_dev)  cudaFree(params_dev);
 
   printf("Writing maximum inundated depth.\n");
   raster_writer.write(h_max, "h_max", t_all);

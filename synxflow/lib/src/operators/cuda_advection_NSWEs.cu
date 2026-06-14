@@ -20,6 +20,7 @@
 */
 
 #include "cuda_advection_NSWEs.h"
+#include "cuda_sediment.h"   // SED_MAX_GROUPS (compile-time cap on sediment groups)
 #include "cuda_kernel_launch_parameters.h"
 //#include "cuda_boundary.h"
 #include "riemann.h"
@@ -1048,7 +1049,7 @@ namespace GC{
         Vector2 _hU_advection(0.0, 0.0);
         Scalar c_this = (hC && h_this >= h_small) ? hC[index] / h_this : (Scalar)0.0;   // [tracer]
         Scalar _hC_advection(0.0);                                                      // [tracer]
-        const int MAXSED = 8;                                                           // [sed] runtime n_sed<=MAXSED
+        const int MAXSED = SED_MAX_GROUPS;                                              // [sed] runtime n_sed<=MAXSED (cuda_sediment.h)
         Scalar c_this_sed[MAXSED];                                                       // [sed]
         Scalar _hCs_advection[MAXSED];                                                   // [sed]
         for (int ks = 0; ks < n_sed; ++ks){                                             // [sed]

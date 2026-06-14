@@ -82,8 +82,25 @@ step 2 放行时触发了预案 (b) **分叉**: 单 kernel 泛化让 n_sed=0 也
 - **理想**: 将公共重构+Riemann 抽成一个 `__device__` inline 函数两 kernel 共用 (消除复制); 当前为复制+本清单约束 (退一步)。重构若抽公共函数, 本表保留作回归基准。
 - 代码内已在两处 (`.cu` kernel 头注释 + `.h` 声明注释) 留了"SYNC: 见 T5_design.md kernel 同步清单"指针。
 
-**验证状态 (step 2, 2026-06-14)**: 3a n_sed=0 对 t2_prewire 字节级 diff=0; 3b cuobjdump 证 n_sed=0 kernel REG:64/STACK:0 无污染;
-3c 合成两组对流-only: max|C0−1|=0、max|C1−0.5|=0 (独立)、泥沙开 h/hU 字节级 IDENTICAL。源汇 E−D 仍未加 (step 3)。
+**验证状态 (step 2, 2026-06-14, commit 26a50a6)**: 3a n_sed=0 对 t2_prewire 字节级 diff=0; 3b cuobjdump 证 n_sed=0 kernel REG:64/STACK:0 无污染;
+3c 合成两组对流-only: max|C0−1|=0、max|C1−0.5|=0 (独立)、泥沙开 h/hU 字节级 IDENTICAL。
+
+**验证状态 (step 3, 2026-06-14)**: E−D 源汇 + τ_b + bed_k + Δz_accum 已实现并接线 (仅 WithSediment 路径)。
+- 闭合: `cuda_sediment_closures.h` (`sed_settling_velocity` const+Zhang 张瑞瑾, Stokes/floc 回退 const; `sed_ED_rate` Partheniades 双阈值)。
+- 算子: `cuda_sediment.cu` (`cuSedimentBedShear` τ_b=ρ_w g n²|u|²/h^⅓; `cuSedimentErosionDeposition` 每组 R5 截断 + bed 守恒 + Δz_accum 计算不施加)。
+- **解析闸 (§9.6 必做) 过**: 纯沉降柱 C(t)=C0·exp(−w_s t/H) 逐时刻 rel.err ≤0.001% (<1%); 悬浮+床面质量守恒 drift 0.0000% (<0.1%)。
+- 回归: step-3 .so 上 3c 仍过 (泥沙含 E−D 机制开启 h/hU 字节级 IDENTICAL); (c) kernel 仍 REG:64/STACK:0。
+- **§F 出口闸全过 (2026-06-14)**: §F.2 可插拔 (仅改 config 的 w_s 1e-3→2e-3 不重编, C(100) 0.905→0.819 随物理变);
+  §F.3 守恒 (沉降柱 + 冲刷算例 Σ(hC)+Σ(bed) drift 0.000%); §F.4 耦合 sanity (高 τ_b 冲刷 C↑/bed↓、低 τ_b 淤积 C↓; 均守恒);
+  §9.6 解析沉降闸 rel.err ≤0.001% (<1%); §F.5 泥沙开 h/hU 字节级 IDENTICAL。
+- **双组分 T5 关闸** (commit 待 n_sed=0 字节级确认)。
+
+### 7.2 多粒径升级 (scope change 2026-06-14: 单 D50 双组分 → 每来源一条级配离散多组)
+框架本就 N 组运行时参数, 升级在"级配生成→离散成组"层 (kernel 多组对流/源汇 step2/3 已成)。
+- **kernel/仓内改动仅robustness**: `SED_MAX_GROUPS=8` (cuda_sediment.h) 编译期上界 + flood 主机守卫 (n_sed>上界报错, 防栈越界); `bed_init` 每组初始床量 (配置驱动, 供冲刷侧测试)。
+- **级配生成在仓外** (`~/synxflow_dev/figs/scripts/gradation.py`): 单 D50 + **假设对数正态 + σg (演示值 2.0) + n_bins (演示 3/源)** → 各档代表粒径+质量占比, 沉速张瑞瑾按档算。
+- **试算验证 PASS** (`validation/t5_multigrain/`): 两来源 (6μm/1μm) 各 3 档共 6 组并行输运, 各档保形 max|C−frac|~1e-7、互不串扰、h/hU 字节级 IDENTICAL。
+- **⚠ σg/n_bins/分布族 = 演示假设, 非结论**; 正式取值、鄱阳湖验证、T6 一律等用户 (见 T_progress ⏸)。
 
 ## 8. τ_b 耦合 + E−D + R5 + bed 守恒 (每组每步)
 1. `τ_b = ρ_w·g·n²·|u|² / h^(1/3)` (|u|=|hU|/h, 干格 0) — helper kernel 出 τ_b 场。

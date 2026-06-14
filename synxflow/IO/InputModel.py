@@ -535,7 +535,7 @@ class InputModel:
         input_dir = os.path.dirname(self._data_folders['field'])
         path = os.path.join(input_dir, 'sediment_setup.dat')
         keys = ['settling_id', 'closure_id', 'cohesive', 'rho_s', 'porosity',
-                'D50', 'w_s', 'tau_ce', 'tau_cd', 'M']
+                'D50', 'w_s', 'tau_ce', 'tau_cd', 'M', 'bed_init']
         with open(path, 'w') as f:
             f.write('$n_groups\n%d\n' % len(self._sediment_groups))
             f.write('$morphology_on\n%d\n' % (1 if self._morphology_on else 0))
