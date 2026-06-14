@@ -218,10 +218,8 @@ int run(const char* work_dir){
   //advections
   cuFvMappedField<Scalar, on_cell> h_advection(h, partial);
   cuFvMappedField<Vector, on_cell> hU_advection(hU, partial);
-  //tracer advection (T2 rider)
+  //tracer advection (T2, fused into main stencil — route 甲-正 c)
   cuFvMappedField<Scalar, on_cell> hC_advection(hC, partial);
-  //per-face interface mass flux cache (4 per cell, layout [i*ncells+index]); flood 主平流落出, 示踪复用
-  cuArray<Scalar> h_flux_cache(4 * h.data.size());
 
   //gradient
   cuFvMappedField<Vector, on_cell> z_gradient(hU, partial);
@@ -302,19 +300,15 @@ int run(const char* work_dir){
     //calculate the surface elevation
     fv::cuBinary(h, z, eta, [] __device__ (Scalar& a, Scalar& b) -> Scalar{return a + b;});
 
-    //calculate advection (also exports per-face mass flux into h_flux_cache; h/hU output identical)
-    fv::cuAdvectionMSWEsCartesianCacheFlux(gravity, h, z, z_gradient, hU, h_advection, hU_advection, h_flux_cache.dev_ptr()); //SRM
-
-    //T2 passive tracer (route 甲-正): hC advection REUSES flood's cached interface mass flux
-    //(no reconstruction/Riemann recompute). hC_flux = cached_mass_flux * c_upwind.
-    fv::cuTransportScalarRiderCached(C, hC, h, h_flux_cache.dev_ptr(), hC_advection);
+    //calculate advection — h/hU AND fused passive-tracer hC in ONE stencil pass (route 甲-正 c).
+    //h/hU output byte-identical to plain advection; hC reuses the live interface mass flux _h_flux.
+    fv::cuAdvectionMSWEsCartesianWithTracer(gravity, h, z, z_gradient, hU, C, hC, h_advection, hU_advection, hC_advection); //SRM
 
     //multiply advection with -1
     fv::cuUnaryOn(h_advection, [] __device__ (Scalar& a) -> Scalar{return -1.0*a;});
     fv::cuUnaryOn(hU_advection, [] __device__ (Vector& a) -> Vector{return -1.0*a;});
-    fv::cuUnaryOn(hC_advection, [] __device__ (Scalar& a) -> Scalar{return -1.0*a;});
-    //tracer Euler step (same dt as h; both advections taken from start-of-step state)
-    fv::cuEulerIntegrator(hC, hC_advection, time_controller.dt(), time_controller.current());
+    //tracer Euler step: fold the sign into -dt (no separate negate kernel). hC += (-dt)*div(hC_flux)
+    fv::cuEulerIntegrator(hC, hC_advection, -1.0*time_controller.dt(), time_controller.current());
 
     //integration
     fv::cuFrictionManningImplicit(time_controller.dt(), gravity, manning_coef, h, hU, hU_advection);
@@ -332,11 +326,11 @@ int run(const char* work_dir){
     h.update_boundary_values();
 
     //T2 R5: source/sink changed h (hC untouched = pure-water source/sink). Recompute C = hC/h (dry->0)
-    //for output/boundary/next-step, then re-derive hC = h*C (round-trip; also zeros dry-cell hC).
+    //for output + next-step boundary. (hC=h*C round-trip dropped: redundant — hC already conserved
+    //post-Euler, dry-cell hC zeroed separately by the momentum_filter-style line below.)
     fv::cuBinary(hC, h, C, [] __device__(Scalar& a, Scalar& b) -> Scalar{ return b >= (Scalar)1e-10 ? a / b : (Scalar)0.0; });
     C.update_time(time_controller.current(), time_controller.dt());
     C.update_boundary_values();
-    fv::cuBinary(h, C, hC, [] __device__(Scalar& a, Scalar& b) -> Scalar{ return a*b; });
 
     //update maximum depth
     fv::cuBinary(h_max, h, h_max, [] __device__(Scalar& a, Scalar b) -> Scalar{ return fmax(a, b); });

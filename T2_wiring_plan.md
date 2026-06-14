@@ -20,6 +20,15 @@
   新增 `cuAdvectionMSWEsCartesianCacheFlux` (传 cache) 供单 GPU run()。
 - **同步义务**: rider 与 flood 平流共用同一 `h_flux_cache` → 天然同通量, 无需手工对齐重构。仅依赖主 kernel 的 `[flux-cache]` 落出行。
 
+**约束 1 终态 (c — 2026-06-14, 已落地并通过硬闸)**:
+> 缓存版 (commit 3c400c7) 仍 +22.9% (大头是独立 rider stencil pass)。终态把 hC 通量散度**融进主平流 stencil**
+> (`cuAdvectionMSWEsCartesianWithTracer` / `cuAdvectionMSWEsCartesianKernel` 加 nullable hC 参数), 复用 kernel 内活着的
+> `_h_flux` 就地累加 `_hC_advection`, **消掉独立 rider pass + 缓存数组**。hC 累加为纯新增语句 (新变量 c_this/c_neib/_hC_advection,
+> 不与 h/hU 算术交错/不共享临时量), nvcc 未重排 h/hU 的 FMA。
+> **硬闸结果**: case_90 h_max/gauge 对纯 flood **字节级 diff=0** (codegen 未漂移); C≡1 max|C-1|=2e-5 (=重算版);
+> **运行时 +9.2%** (2450.9s vs 2244s, 单 GPU 36 天); cuobjdump 10x sm_120。并入 (b): 取负折进 Euler(-dt)、删冗余 hC=h*C。
+> 缓存版 (3c400c7) 与重算版 (b212942) 留在历史作为 fallback/记录; 终态为融合版。
+
 **约束 2 — 字节级旁证 (比 C≡1 更早抓意外改动)**:
 - 接线编译后, 对 `case_90_n020` 跑一发: 因甲不动 h/hU, **h_max/gauge 必须与接线前逐位一致 (diff 全 0 字节级, 不是阈内)**;
   这直接坐实流场未被碰。**同一发**里 C0=1、入流 C=1, 验 `max|C−1|<1e-4` (C≡1 出口闸)。两结果一起进 `T_progress.md`。
