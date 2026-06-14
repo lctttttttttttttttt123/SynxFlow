@@ -66,6 +66,12 @@ namespace GC{
     ///byte-identical to cuAdvectionMSWEsCartesian (hC additions are pure appended statements).
     void cuAdvectionMSWEsCartesianWithTracer(cuFvMappedField<Scalar, on_cell>& gravity, cuFvMappedField<Scalar, on_cell>& h, cuFvMappedField<Scalar, on_cell>& z, cuFvMappedField<Vector, on_cell>& z_gradient, cuFvMappedField<Vector, on_cell>& hU, cuFvMappedField<Scalar, on_cell>& C, cuFvMappedField<Scalar, on_cell>& hC, cuFvMappedField<Scalar, on_cell>& h_advection, cuFvMappedField<Vector, on_cell>& hU_advection, cuFvMappedField<Scalar, on_cell>& hC_advection);
 
+    ///T5 (fork): TWIN of cuAdvectionMSWEsCartesianWithTracer + N sediment groups (advection only).
+    ///Separate kernel so the n_sed=0 passive path keeps the (c) kernel (no sediment register pressure).
+    ///hCs_dev/Csbound_dev/hCs_adv_dev = DEVICE arrays of n_sed Scalar*. SYNC: advection/Riemann must
+    ///stay line-for-line with cuAdvectionMSWEsCartesian(WithTracer) — see T5_design.md kernel 同步清单.
+    void cuAdvectionMSWEsCartesianWithSediment(cuFvMappedField<Scalar, on_cell>& gravity, cuFvMappedField<Scalar, on_cell>& h, cuFvMappedField<Scalar, on_cell>& z, cuFvMappedField<Vector, on_cell>& z_gradient, cuFvMappedField<Vector, on_cell>& hU, cuFvMappedField<Scalar, on_cell>& C, cuFvMappedField<Scalar, on_cell>& hC, cuFvMappedField<Scalar, on_cell>& h_advection, cuFvMappedField<Vector, on_cell>& hU_advection, cuFvMappedField<Scalar, on_cell>& hC_advection, Scalar** hCs_dev, Scalar** Csbound_dev, Scalar** hCs_adv_dev, int n_sed);
+
     ///A fast 1st order surface reconstruction method for non-hydrostatic SWEs on Cartesian grids only
     void cuAdvectionNSWEsSRMCartesian(cuFvMappedField<Scalar, on_cell>& gravity, cuFvMappedField<Scalar, on_cell>& centrifugal, cuFvMappedField<Scalar, on_cell>& h, cuFvMappedField<Scalar, on_cell>& z, cuFvMappedField<Vector, on_cell>& z_gradient, cuFvMappedField<Vector, on_cell>& hU, cuFvMappedField<Scalar, on_cell>& h_advection, cuFvMappedField<Vector, on_cell>& hU_advection);
 

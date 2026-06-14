@@ -59,6 +59,11 @@
 #include "cuda_gisascii_writer.h"
 //These header files are for shallow water equations advection
 #include "cuda_advection_NSWEs.h"
+//T5: pluggable sediment transport (config parser + per-group params)
+#include "cuda_sediment.h"
+#include <vector>
+#include <memory>
+#include <string>
 //The header file for gradient
 #include "cuda_gradient.h"
 //The header file for limiter
@@ -165,6 +170,18 @@ int run(const char* work_dir){
   //T2 passive tracer C (initial concentration field)
   fvScalarFieldOnCell C_host(fvMeshQueries(mesh), completeFieldReader("input/field/", "C"));
 
+  //T5: read pluggable sediment config (absent file -> n_sed=0 -> identical to pure passive path).
+  //  step 2 only uses n_sed (advection generalisation); per-group params (w_s/tau_*/M) drive E-D in step 3.
+  SedimentConfig sed_cfg = read_sediment_setup("input/sediment_setup.dat");
+  const int n_sed = sed_cfg.n_groups();
+  //per-group initial concentration host fields C0,C1,... (registered by InputModel.set_sediment_groups)
+  std::vector<std::shared_ptr<fvScalarFieldOnCell>> Csed_host;
+  for (int k = 0; k < n_sed; ++k){
+    std::string nm = "C" + std::to_string(k);
+    Csed_host.push_back(std::make_shared<fvScalarFieldOnCell>(fvMeshQueries(mesh), completeFieldReader("input/field/", nm.c_str())));
+  }
+  if (n_sed > 0) std::cout << "T5: " << n_sed << " sediment group(s) (morphology_on=" << sed_cfg.morphology_on << ")" << std::endl;
+
   //precipitation
   fvScalarFieldOnCell precipitation_host(fvMeshQueries(mesh), completeFieldReader("input/field/", "precipitation"));
 
@@ -189,6 +206,14 @@ int run(const char* work_dir){
   //T2 passive tracer: concentration C (device) + conserved quantity hC = h*C
   cuFvMappedField<Scalar, on_cell> C(C_host, mesh_ptr_dev);
   cuFvMappedField<Scalar, on_cell> hC(h, partial);
+  //T5: per-group device fields — concentration C_k, conserved hC_k = h*C_k, advection rider hC_k_adv.
+  //  shared_ptr so the vector owns stable device buffers (no copy/realloc of cuFvMappedField).
+  std::vector<std::shared_ptr<cuFvMappedField<Scalar, on_cell>>> Csed, hCsed, hCsed_adv;
+  for (int k = 0; k < n_sed; ++k){
+    Csed.push_back(std::make_shared<cuFvMappedField<Scalar, on_cell>>(*Csed_host[k], mesh_ptr_dev));
+    hCsed.push_back(std::make_shared<cuFvMappedField<Scalar, on_cell>>(h, partial));
+    hCsed_adv.push_back(std::make_shared<cuFvMappedField<Scalar, on_cell>>(h, partial));
+  }
   cuFvMappedField<Scalar, on_cell> culmulative_depth(culmulative_depth_host, mesh_ptr_dev);
   cuFvMappedField<Scalar, on_cell> hydraulic_conductivity(hydraulic_conductivity_host, mesh_ptr_dev);
   cuFvMappedField<Scalar, on_cell> capillary_head(capillary_head_host, mesh_ptr_dev);
@@ -242,6 +267,27 @@ int run(const char* work_dir){
   C.update_boundary_values();
   fv::cuBinary(h, C, hC, [] __device__(Scalar& a, Scalar& b) -> Scalar{ return a*b; });
 
+  //T5: per-group boundary @ t0, init hC_k = h*C_k, then assemble device Scalar** pointer arrays
+  //  (dev_ptr() of data/boundary buffers is stable for the run -> assemble once).
+  Scalar **hCs_dev = nullptr, **Csbound_dev = nullptr, **hCs_adv_dev = nullptr;
+  if (n_sed > 0){
+    std::vector<Scalar*> hCs_host(n_sed), Csbound_host(n_sed), hCs_adv_host(n_sed);
+    for (int k = 0; k < n_sed; ++k){
+      Csed[k]->update_time(time_controller.current(), 0.0);
+      Csed[k]->update_boundary_values();
+      fv::cuBinary(h, *Csed[k], *hCsed[k], [] __device__(Scalar& a, Scalar& b) -> Scalar{ return a*b; });
+      hCs_host[k]     = hCsed[k]->data.dev_ptr();
+      Csbound_host[k] = Csed[k]->boundary_value.dev_ptr();
+      hCs_adv_host[k] = hCsed_adv[k]->data.dev_ptr();
+    }
+    checkCuda(cudaMalloc(&hCs_dev,     n_sed * sizeof(Scalar*)));
+    checkCuda(cudaMalloc(&Csbound_dev, n_sed * sizeof(Scalar*)));
+    checkCuda(cudaMalloc(&hCs_adv_dev, n_sed * sizeof(Scalar*)));
+    checkCuda(cudaMemcpy(hCs_dev,     hCs_host.data(),     n_sed * sizeof(Scalar*), cudaMemcpyHostToDevice));
+    checkCuda(cudaMemcpy(Csbound_dev, Csbound_host.data(), n_sed * sizeof(Scalar*), cudaMemcpyHostToDevice));
+    checkCuda(cudaMemcpy(hCs_adv_dev, hCs_adv_host.data(), n_sed * sizeof(Scalar*), cudaMemcpyHostToDevice));
+  }
+
   //ascii raster writer
   cuGisAsciiWriter raster_writer("input/mesh/DEM.txt");
 
@@ -291,6 +337,10 @@ int run(const char* work_dir){
   h.update_boundary_source("input/field/", "h");
   hU.update_boundary_source("input/field/", "hU");
   C.update_boundary_source("input/field/", "C");
+  for (int k = 0; k < n_sed; ++k){                       //T5: per-group concentration boundary source
+    std::string nm = "C" + std::to_string(k);
+    Csed[k]->update_boundary_source("input/field/", nm.c_str());
+  }
 
   //Main loop
   do{
@@ -302,13 +352,23 @@ int run(const char* work_dir){
 
     //calculate advection — h/hU AND fused passive-tracer hC in ONE stencil pass (route 甲-正 c).
     //h/hU output byte-identical to plain advection; hC reuses the live interface mass flux _h_flux.
-    fv::cuAdvectionMSWEsCartesianWithTracer(gravity, h, z, z_gradient, hU, C, hC, h_advection, hU_advection, hC_advection); //SRM
+    //T5 fork: n_sed=0 keeps the validated (c) WithTracer kernel (no sediment register pressure);
+    //  n_sed>0 uses the twin WithSediment kernel (same _h_flux upwind for all groups, one pass).
+    if (n_sed > 0){
+      fv::cuAdvectionMSWEsCartesianWithSediment(gravity, h, z, z_gradient, hU, C, hC, h_advection, hU_advection, hC_advection, hCs_dev, Csbound_dev, hCs_adv_dev, n_sed); //SRM
+    }
+    else{
+      fv::cuAdvectionMSWEsCartesianWithTracer(gravity, h, z, z_gradient, hU, C, hC, h_advection, hU_advection, hC_advection); //SRM
+    }
 
     //multiply advection with -1
     fv::cuUnaryOn(h_advection, [] __device__ (Scalar& a) -> Scalar{return -1.0*a;});
     fv::cuUnaryOn(hU_advection, [] __device__ (Vector& a) -> Vector{return -1.0*a;});
     //tracer Euler step: fold the sign into -dt (no separate negate kernel). hC += (-dt)*div(hC_flux)
     fv::cuEulerIntegrator(hC, hC_advection, -1.0*time_controller.dt(), time_controller.current());
+    //T5 step 2: per-group Euler (advection ONLY — E-D source/sink is step 3, never added here).
+    for (int k = 0; k < n_sed; ++k)
+      fv::cuEulerIntegrator(*hCsed[k], *hCsed_adv[k], -1.0*time_controller.dt(), time_controller.current());
 
     //integration
     fv::cuFrictionManningImplicit(time_controller.dt(), gravity, manning_coef, h, hU, hU_advection);
@@ -331,6 +391,12 @@ int run(const char* work_dir){
     fv::cuBinary(hC, h, C, [] __device__(Scalar& a, Scalar& b) -> Scalar{ return b >= (Scalar)1e-10 ? a / b : (Scalar)0.0; });
     C.update_time(time_controller.current(), time_controller.dt());
     C.update_boundary_values();
+    //T5 R5: per-group recompute C_k = hC_k/h (dry->0) for output + next-step boundary upwind
+    for (int k = 0; k < n_sed; ++k){
+      fv::cuBinary(*hCsed[k], h, *Csed[k], [] __device__(Scalar& a, Scalar& b) -> Scalar{ return b >= (Scalar)1e-10 ? a / b : (Scalar)0.0; });
+      Csed[k]->update_time(time_controller.current(), time_controller.dt());
+      Csed[k]->update_boundary_values();
+    }
 
     //update maximum depth
     fv::cuBinary(h_max, h, h_max, [] __device__(Scalar& a, Scalar b) -> Scalar{ return fmax(a, b); });
@@ -372,6 +438,9 @@ int run(const char* work_dir){
     fv::cuBinaryOn(hU, h, momentum_filter);
     //T2 R5: momentum_filter 同款对 hC 清零 (干格 h<=1e-10 -> hC=0), 防虚假浓度
     fv::cuBinaryOn(hC, h, [] __device__(Scalar& a, Scalar& b) -> Scalar{ return b <= (Scalar)1e-10 ? (Scalar)0.0 : a; });
+    //T5 R5: per-group dry-cell hC_k zeroing
+    for (int k = 0; k < n_sed; ++k)
+      fv::cuBinaryOn(*hCsed[k], h, [] __device__(Scalar& a, Scalar& b) -> Scalar{ return b <= (Scalar)1e-10 ? (Scalar)0.0 : a; });
 
 
     cudaEventRecord(stop);
@@ -389,6 +458,10 @@ int run(const char* work_dir){
       raster_writer.write(hUx, "hUx", t_out);
       raster_writer.write(hUy, "hUy", t_out);
       raster_writer.write(C, "C", t_out);
+      for (int k = 0; k < n_sed; ++k){                    //T5: per-group concentration raster
+        std::string nm = "C" + std::to_string(k);
+        raster_writer.write(*Csed[k], nm.c_str(), t_out);
+      }
       t_out += dt_out;
     }
     
@@ -403,6 +476,11 @@ int run(const char* work_dir){
 
 
   } while (!time_controller.is_end());
+
+  //T5: free device pointer arrays (per-group field buffers freed by shared_ptr dtors)
+  if (hCs_dev)     cudaFree(hCs_dev);
+  if (Csbound_dev) cudaFree(Csbound_dev);
+  if (hCs_adv_dev) cudaFree(hCs_adv_dev);
 
   printf("Writing maximum inundated depth.\n");
   raster_writer.write(h_max, "h_max", t_all);

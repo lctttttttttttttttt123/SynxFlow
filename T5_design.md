@@ -66,6 +66,25 @@ $group 1
   kernel 算出 `_h_flux` 后**内层 loop k** 用同一 `_h_flux` 迎风累加各 `hC_adv[k]`。hC 累加为**纯新增语句** (不与 h/hU 算术交错), 保 h/hU 字节级不变。
 - 设备侧 `Scalar**` = 主机组装指针数组拷到 device。T2 单标量 `WithTracer` 保留 (N=1 passive 用)。
 
+### 7.1 KERNEL 同步清单 (twin kernel 维护义务 — 改一个必须同步另一个)
+step 2 放行时触发了预案 (b) **分叉**: 单 kernel 泛化让 n_sed=0 也带 MAXSED=8 栈数组 → 寄存器压力
+(实测 +26% vs (c) +9.2%), 污染了已验证的被动路径。故保留两个**孪生** kernel:
+
+| kernel | 路径 | REG/STACK (sm_120) | 用途 |
+|---|---|---|---|
+| `cuAdvectionMSWEsCartesianKernel` (= 路线甲-正 (c)) | n_sed=0 | **REG:64 / STACK:0** | `cuAdvectionMSWEsCartesian` (single_run, nullptr×3) + `cuAdvectionMSWEsCartesianWithTracer` (flood passive 标量 C) |
+| `cuAdvectionMSWEsCartesianWithSedimentKernel` | n_sed>0 | REG:72 / STACK:160 | `cuAdvectionMSWEsCartesianWithSediment` (h/hU + 被动 C + N 组泥沙, 一趟) |
+
+**铁律**: 两 kernel 的 **重构 (MSWEs surface reconstruction) + HLLC Riemann + h/hU/_z_flux 算术**必须**逐行同源**。
+- 任一方改对流/Riemann 逻辑, **另一方必须同步**, 否则 n_sed=0 与 n_sed>0 的流场会分叉。
+- 泥沙相关语句在 WithSediment kernel 里全部是 `// [sed]` / `// [tracer]` 标注的**纯新增 append 语句**
+  (新变量、不与 h/hU 算术共享临时量、不交错), 故 nvcc 不重排 h/hU 的 FMA → h/hU 字节级不变 (3c [a] 实证: 泥沙开关 h/hU 逐位 IDENTICAL)。
+- **理想**: 将公共重构+Riemann 抽成一个 `__device__` inline 函数两 kernel 共用 (消除复制); 当前为复制+本清单约束 (退一步)。重构若抽公共函数, 本表保留作回归基准。
+- 代码内已在两处 (`.cu` kernel 头注释 + `.h` 声明注释) 留了"SYNC: 见 T5_design.md kernel 同步清单"指针。
+
+**验证状态 (step 2, 2026-06-14)**: 3a n_sed=0 对 t2_prewire 字节级 diff=0; 3b cuobjdump 证 n_sed=0 kernel REG:64/STACK:0 无污染;
+3c 合成两组对流-only: max|C0−1|=0、max|C1−0.5|=0 (独立)、泥沙开 h/hU 字节级 IDENTICAL。源汇 E−D 仍未加 (step 3)。
+
 ## 8. τ_b 耦合 + E−D + R5 + bed 守恒 (每组每步)
 1. `τ_b = ρ_w·g·n²·|u|² / h^(1/3)` (|u|=|hU|/h, 干格 0) — helper kernel 出 τ_b 场。
 2. 对流+Euler 推进 hC_k (§7)。
