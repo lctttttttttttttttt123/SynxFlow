@@ -1,6 +1,7 @@
 # T6_design.md — 磷 (P) 吸附-输运模块 · 接口设计蓝图
 
-> **状态**: 接口设计 (2026-06-15)。本文件是开 T6 实现的权威蓝图。**未进实现, 出蓝图后停, 等用户审过才开实现第一步** (同 T5 纪律: 先定接口再填物理)。
+> **状态**: 接口设计 (2026-06-15; **第 1 轮审核后修订 2026-06-15**)。本文件是开 T6 实现的权威蓝图。**未进实现, 出蓝图后停, 等用户重审才开实现第一步** (同 T5 纪律: 先定接口再填物理)。
+> **审核修订 (4 处, 均蓝图层)**: ①§4 准二级速率式纠错 (默认改一阶 `k_ads·(q*−q)`, 禁外挂 sign, 旧 `(q*−q)²·sign` 作废; §9.7 同步) ②§4+§10 加 stiff/显式稳定性硬保护 (限幅 `|Δq|≤|q*−q|`) ③§3 Qmax=0 惰性组语义 + 除零安全明确 ④§7 末点明 additive 输出"碰已验证 kernel"的专项验收硬闸 (n_phos=0 字节级 + cuobjdump nullptr 零扰动, §9.5 提级)。
 > **原则**: 沿用 T5 可插拔框架纪律 —— 公式/参数/速率常数皆配置驱动, kernel 不硬编码任何磷物理数值; 加全新闭合=加 enum case 重编, 换已实现闭合+改参=纯改配置不重编。
 > **载体**: 复用 T5 已成的多组 hC 平流框架 (路线甲-正 `_h_flux` 迎风) + bed_k 存量模式 + closures.h 枚举派发风格。
 > **参数底稿**: `handoff/T6_literature.md` (长江流域借鉴文献, 无鄱阳本地实测, 正式值留率定)。
@@ -49,17 +50,20 @@
 
 - **POD 参数** `PhosphorusParams` (每组, 设备可用): `Qmax, K, EPC0, k_ads, q0` + `sorption_mode_id` (全局或每组, 见 §4)。
 - **全局** `PhosphorusConfig`: `phosphorus_on (默认0)`, `sorption_mode_id`, `vector<PhosphorusParams> groups` (索引对齐 sediment 组), 溶解相初值/边界句柄。
-- **挂载**: 颗粒相 P 参数索引严格对齐 sediment 组 (组 k 的 P 吸附在组 k 的泥沙上); n_phos 组数 == n_sed (或子集, 设计取 ==n_sed, 未指定组退化为不吸附 Qmax=0)。
+- **挂载**: 颗粒相 P 参数索引严格对齐 sediment 组 (组 k 的 P 吸附在组 k 的泥沙上); n_phos 组数 == n_sed (设计取 ==n_sed)。
+- **Qmax=0 惰性组 (确认默认语义 + 数值安全)**: 未指定 / 粗组**默认 Qmax=0 → 不挂磷** —— 这是要的默认 (粗颗粒惰性, 对溶解磷零吸附)。Qmax=0 组走**惰性分支**: q*≡0、本组净转移强制 0、不参与两相交换。闭合**对 Qmax=0 必须除零安全**: `q*=Qmax·K·Pd/(1+K·Pd)` 分母恒 ≥1 无奇点; 但任何 `q/q*` 归一化 (准二级载量比、诊断 q_k 等) 须**显式防 0** —— q*=0 即短路为零转移, 绝不做 `/q*` 除法。
 
 ## 4. 吸附闭合抽象 (新 `cuda_phosphorus_closures.h`, 镜像 cuda_sediment_closures.h 风格)
 
 `__device__ inline`, 枚举派发, 零硬编码物理量:
 - `langmuir_qstar(const PhosphorusParams& p, Scalar Pd)` → `Qmax·K·Pd/(1+K·Pd)` (平衡载量 helper)。
 - `phos_sorption_rate(const PhosphorusParams& p, int mode_id, Scalar Pd, Scalar q_k, Scalar dt)` → 本步 Pd↔q_k 净转移量:
-  - `mode_id=0` 动力学 (默认): 准二级 `dq/dt = k_ads·(q*−q)²·sign` 或一阶 `dq/dt = k_ads·(q*−q)` (实现期定一式, 另一式留 enum 子位); q* 由 langmuir_qstar + EPC0 参考给出。**速率常数 k_ads 从配置读**。
+  - `mode_id=0` 动力学 (默认): **默认一阶线性** `dq/dt = k_ads·(q*−q)` —— 天然带正确符号 (q<q* 吸附、q>q* 解吸)、单调趋平衡、吸附解吸统一一式, 且正好对应 §9.7 一阶解析弛豫闸。q* 由 `langmuir_qstar` + EPC0 参考给出 (Pd>EPC0 → q*>q 净吸附; Pd<EPC0 → q*<q 净解吸; 死区 Pd≈EPC0 → q*≈q → 速率自然趋 0, **连续无跳变**)。**速率常数 k_ads 从配置读**。
+    - 准二级留 **enum 子位** (mode_id=0 内次级开关), 实现期可选。**若实现, 方向必须由 `q*−q` 自身符号决定** (如 `dq/dt = k_ads·(q*−q)·|q*−q|`); **禁止外挂独立 sign**。旧式 `(q*−q)²·sign` **作废**: 平方项抹掉 q−q* 符号、再外挂按 Pd−EPC0 判的 sign, 两符号源不一致 → 死区附近方向错/不连续。
   - `mode_id=1` 瞬时平衡: 每步把 (Pd, q_k) 沿 Langmuir 等温线 + 总磷守恒约束**解析重分配**到平衡点 (一步到 q*)。
   - 返回值符号: >0 净吸附 (Pd→颗粒, Pd↓), <0 净解吸 (颗粒→Pd, Pd↑); 死区 (Pd≈EPC0) → 0。
 - **正定/守恒**: 转移量 R5 风格截断 (`Pd≥0`、`q_k≥0`、不超 Qmax 饱和); 配套保证 Pd 减少量 == Σ_k 颗粒增加量 (两相严格守恒)。
+- **stiff / 显式稳定性 (默认硬保护)**: 吸附用显式 Euler 推进, 若配置 k_ads 快 (平衡时间 ≪ dt≈2.7s) 会**振荡/发散且隐蔽**。闭合内对单步转移**限幅 `|Δq| ≤ |q*−q|`** (把 q 一步推到 q* 所需量为上界, 等价隐式稳定下界, 近零成本) —— 作**默认硬保护**: 最快也只到 q*、不过冲, 保证**任何配置 k_ads 不因取值快而数值炸**。可选加严 (扩展点, 非默认): `k_ads·dt` 越界时子步细分或报错。
 
 ## 5. 溶解相 + 颗粒相磷的输运 (h/hU 字节级不变, 红线照旧)
 
@@ -101,8 +105,9 @@ Pd_init  0.0        # 初始溶解磷 (或走 grid-file Pd)
 - sediment E−D (`cuSedimentErosionDeposition`) 现算每组 `dmass = ed·dt` (泥沙 hC_k↔bed_k 迁移)。T6 需要的是**分数** `f_k = dmass / hC_k` (或迁移绝对量), 供 P 按比例搬运。
 - **设计**: 给 sediment E−D 加一个**可选 additive 输出**每组迁移量场 (`phosphorus_on` 时分配, 否则 nullptr); **不改其 h/hU 无关的既有算术**, 仅多写一个输出 → sediment 单独跑 (n_phos=0) 行为字节级不变 (须回归验证)。
 - P 床面转移算子读该输出, 按比例移 hPp_k↔bedPp_k; 总磷守恒 = sediment 守恒 + P 比例搬运守恒。
-
-## 8. scope / 非目标
+- **§7 改动专项验收硬闸 (碰已验证 kernel, 提级)**: 给 `cuSedimentErosionDeposition` 加 additive 输出**属"碰已验证 kernel"**, 不走泛回归, 设**专项硬闸** (§9.5 在此提级):
+  ① 改完 **n_phos=0 对 T5 shipping .so 字节级 `cmp diff=0` (IDENTICAL)**; ② **cuobjdump 确认输出场 nullptr 路径零 codegen 扰动** (nullptr 时 SASS 与改前一致、寄存器足迹不变)。
+  即: additive 输出未接磷时**必须证明对既有泥沙路径零影响**, 否则 §7 改动不放行。
 
 - **磷依赖 n_sed>0** (颗粒相需泥沙载体)。纯溶解-守恒磷 (无泥沙、无反应) 已可用 T2 (c) 路表达, 不在 T6。
 - 默认实现: 动力学 (准二级或一阶, 实现期定) + 瞬时平衡两支; Langmuir 等温线; Freundlich/双点位/非黏性磷预留 enum 不实现。
@@ -116,17 +121,18 @@ Pd_init  0.0        # 初始溶解磷 (或走 grid-file Pd)
 2. **可插拔**: 仅改 phosphorus_setup.dat (换 sorption_mode / Qmax/K/EPC0/k_ads / n_pgroups) **不重编**, 行为随之变 (贴前后对比)。
 3. **守恒**: 闭箱无净源, `Σ(hPd)+Σ_k(hPp_k)+Σ_k(bedPp_k)` 守恒 <0.1% (全精度 backup)。
 4. **无回归**: 泥沙各闸仍过; **磷开启后 h/hU 字节级 diff=0** (z 未动); sediment-only (n_phos=0) 对 T5 .so 行为字节级。
-5. **n_phos=0 字节级**: 磷关 → 整体对 T5 shipping .so cmp diff=0 (IDENTICAL); WithSediment kernel 寄存器足迹不因 P append 失控污染 (cuobjdump 复核)。
+5. **n_phos=0 字节级**: 磷关 → 整体对 T5 shipping .so cmp diff=0 (IDENTICAL); WithSediment kernel 寄存器足迹不因 P append 失控污染 (cuobjdump 复核)。**注: §7 给 sediment E−D 加 additive 输出的字节级验收已提级为 §7 专项硬闸 (碰已验证 kernel), 见 §7 末; 本条 §9.5 覆盖 P 模块整体的 n_phos=0 字节级。**
 
 **解析闸 (钉物理正确性, 至少一条; §自洽过不了的)**:
 6. **静水吸附平衡闸 (必做)**: 单/多组, 静水 (hU=0), 恒定泥沙 (无沉降/冲刷, τ_b 死区), 给定初始 Pd + q0。
    解析: 吸附达平衡时两相分配对 **Langmuir 等温线** `q*=Qmax·K·Pd_eq/(1+K·Pd_eq)` + 总磷守恒联立解 (Pd_eq 唯一)。判据: 平衡态两相分配相对误差 <1%。验**等温线系数 + EPC0 + 总磷守恒**正确。合成数据, 不进库。
-7. **纯解吸一阶速率闸 (可选, 成本低则做)**: 静水, 恒定泥沙带初始载量 q0, Pd 初值 < EPC0 → 解吸; 验 Pd(t) 向平衡的**一阶/准二级速率**对解析衰减/增长曲线 (镜像 T5 沉降柱闸), 抓 k_ads 系数 + 时间积分错误。
+7. **纯解吸一阶弛豫闸 (可选, 成本低则做)**: 静水, 恒定泥沙带初始载量 q0, **Pd 钉定** (大/恒定溶解储库 → q* 恒, 把速率项隔离出来做干净解析对照) 且 q0>q* (EPC0 偏低 → 解吸)。**默认一阶模式**有精确解析解 `q(t) = q* + (q0−q*)·exp(−k_ads·t)` (镜像 T5 沉降柱 exp 闸)。判据: 逐时刻 rel.err <1% (或与一阶时间积分截断误差一致的容差, 取严)。验 **k_ads 系数 + 量纲 + 时间积分**正确, 不只守恒。准二级子模式则对其对应解析速率律。合成数据, 不进库。
 
 ## 10. 红线 / 非目标
 
 - **单 GPU only** (多 GPU single_run 不接磷, 留 TODO); **T6 绝不动 master**; **h/hU 数值路径字节级不动** (磷开 == 磷关 == 纯 flood, 硬闸验)。
 - **磷参数全配置化, kernel 零硬编码物理量** (Qmax/K/EPC0/k_ads/q0 皆配置读; 仅普适常数/公式身份在码内)。
+- **动力学 stiff 安全 (硬约束)**: 显式 Euler 推进吸附**必须**带 §4 的默认限幅 `|Δq| ≤ |q*−q|` —— **可配置 k_ads 不会因取值快 (平衡时间 ≪ dt≈2.7s) 而数值炸**; 这是默认硬保护, 不是可选项。
 - 发布边界钩子常开; 真实流域数据 + 级配留仓库外; 合成验证算例入 validation/ 或仓外。
 - 物理数值占位/文献缺省 (T6_literature.md) 把框架跑通; 真实标定 (Qmax/K/EPC0 率定 + 鄱阳级配) 留验证阶段。
 
