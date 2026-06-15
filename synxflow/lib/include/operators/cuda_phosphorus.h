@@ -104,4 +104,36 @@ namespace GC {
 
 }  // namespace GC
 
+// -------- §5/§7 device operators (declared only for CUDA translation units) --------
+// Guarded by __CUDACC__ so the host-only config/POD/parser above stays compilable without CUDA
+// headers (the out-of-repo round-trip test includes this header with plain g++).
+#ifdef __CUDACC__
+#include "cuda_mapped_field.h"
+#include "Flag.h"
+#include "Vector.h"
+#include "cuda_sediment.h"   // SedimentParams (the §7 bed-transfer recomputes dmass via the SAME closure)
+
+namespace GC {
+  namespace fv {
+    // §5 sorption: per cell, per group, exchange dissolved hPd <-> particulate hPp_k via the Langmuir
+    // closure (口径 I: rate = k_ads*(q*-q), q*=langmuir_qstar; mode 1 = coupled equilibrium solve).
+    // q_k = hPp_k/hC_k with a sediment-tends-to-zero divide guard (R5; revision C). Conserves total P.
+    void cuPhosphorusSorption(cuFvMappedField<Scalar, on_cell>& h, cuFvMappedField<Scalar, on_cell>& hPd,
+                              Scalar** hPps_dev, Scalar** hCs_dev, PhosphorusParams* pparams_dev,
+                              int mode_id, int n_phos, Scalar dt);
+
+    // §7 bed transfer (route ①): runs BEFORE cuSedimentErosionDeposition, reads the SAME pre-E-D
+    // read-only fields (h, tau_b, hC_k, bed_k), recomputes the identical per-group dmass via the SAME
+    // sed_ED_rate + R5 clamp, and moves hPp_k <-> bedPp_k by the proportional sediment mass fraction.
+    // Writes ONLY hPp_k / bedPp_k — never touches hC_k / bed_k. sparams_dev = sediment params (device).
+    // dmass_dbg_dev (optional, nullptr in production): per-group dmass output for the bit-exact
+    // consistency cross-test against the E-D kernel's hC_k delta.
+    void cuPhosphorusBedTransfer(cuFvMappedField<Scalar, on_cell>& h, cuFvMappedField<Scalar, on_cell>& tau_b,
+                                 Scalar** hCs_dev, Scalar** beds_dev, Scalar** hPps_dev, Scalar** bedPps_dev,
+                                 SedimentParams* sparams_dev, int n_phos, Scalar dt,
+                                 Scalar** dmass_dbg_dev = nullptr);
+  }  // namespace fv
+}  // namespace GC
+#endif  // __CUDACC__
+
 #endif
