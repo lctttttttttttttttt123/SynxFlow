@@ -1,7 +1,7 @@
 # T6_wiring_plan.md — 磷模块接线计划 (路线依据, 等用户裁两处)
 
 > **性质**: 仓库内白名单 .md (同 T2_wiring_plan.md)。**路线决策文档**, 给用户据此裁 §7 路线 + §4 EPC0 口径。
-> **状态 (2026-06-15)**: step 1 配置层**已落地** (commit: `cuda_phosphorus.h` 解析器 + POD + `InputModel.set_phosphorus_groups` 写出; round-trip 过、n_phos=0 对 T5 .so codegen 字节级)。**§4/§5/§7 实现码一行未写**。本文件只给依据 + 推荐, **STOP 等用户裁 (A) §7 路线 + (B) §4 EPC0 口径后, 才放行那两块码**。
+> **状态 (2026-06-15)**: step 1 配置层**已落地** (commit `53c67dd`/`088b036`)。**用户已裁定 (2026-06-15): (A) §7 = 路线① · (B) §4 = 口径 I**, §4/§5/§7 放行, 按 AUTOPILOT 自主推进。裁定细则见文末"决策块 (已裁)"。本文件原为路线决策依据, 现转为实现期权威接线约定。
 > **设计权威**: `T6_design.md` (含第1轮审核修订①~④ + 本轮决策侧重审修订 A~D)。**红线照旧**: 单 GPU、不动 master、h/hU 字节级、不动 z、磷参数全配置化、钩子常开。
 
 ---
@@ -115,9 +115,17 @@ t=0 时: EPC0_0 = q0 / ( K·(Qmax − q0) )
 
 ---
 
-## 决策块 (STOP — 等用户裁这两处, 才放行 §4/§7 码)
+## 决策块 (已裁 — 2026-06-15 用户裁定, §4/§5/§7 放行)
 
-1. **(A) §7 路线**: 路线 ① 独立重算 (推荐, sediment kernel 不动、无专项硬闸) / 路线 ② additive 输出 (单源但碰已验证 kernel、触发专项硬闸)。
-2. **(B) §4 EPC0 口径**: 口径 I Langmuir 主参考·EPC0 诊断 (推荐) / 口径 II EPC0 主锚·q0 导出。
+**(A) §7 = 路线① (三不变量焊死; 路线②作废不实现)**:
+1. **顺序**: `cuPhosphorusBedTransfer` 插在 `cuSedimentErosionDeposition` **之前**, 读 E−D 同一批 pre-E−D 只读前值 (h, hC_k, bed_k, τ_b); P 算子**只写 hPp_k/bedPp_k, 绝不碰 hC_k/bed_k**。
+2. **单源**: dmass 只由 `sed_ED_rate` 闭合 + 同一 R5 算出, 两算子调**同一闭合, 公式零复制** (复用调用不复写公式)。
+3. **守闸**: 新增逐格 dmass 一致性交叉测试, 断言 P 算子 dmass == E−D dmass **每格 bit-exact**, 任一格不等即 STOP。
+4. **sediment E−D kernel 一字节不动** (不加出参、不改 ABI)。
 
-裁定后: 按所选路线写 §7 dmass 接口 + §4 吸附闭合; §C 护栏随 §5 落实; §D 解吸闸随实现落地。**未裁定前, §4/§5/§7 一行不写。**
+**(B) §4 = 口径 I**:
+1. kernel 速率恒 `k_ads·(q*−q)`, `q* = langmuir_qstar(Qmax, K, Pd)`; **EPC0 不进 kernel 速率** (仅导出诊断 `EPC0(q)=q/(K(Qmax−q))`)。
+2. config 主参数 **Qmax / K / q0**; EPC0 可选输入则 `q0 = q*(EPC0) = Qmax·K·EPC0/(1+K·EPC0)` 在 **Python 层**导出; Qmax/K 与 EPC0 同时给且不自洽 → **warning 不静默择一**。
+3. `T6_literature.md` 每组同登 {Qmax, K, q0} 与导出 EPC0 (§4 放行后钉)。
+
+**实现范围 (§11 commit 粒度)**: §4 closures → §5 sorption+P 平流 (含 (C) 护栏) → §7 bed-transfer (路线①) → 孪生 kernel 同步 `// [phos]` 行。**出口闸**见 T_progress 顶部 (六闸全过才 close)。
