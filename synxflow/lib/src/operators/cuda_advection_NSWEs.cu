@@ -1007,14 +1007,19 @@ namespace GC{
     // cuAdvectionMSWEsCartesianWithSedimentKernel — T5 (fork from step2): h/hU + passive C +
     // N sediment groups in ONE fused stencil pass (advection only; E-D applied by caller, step3).
     //
-    // 【KERNEL 同步清单 — 见 T5_design.md】: the h/hU reconstruction + cuHLLCRiemannSolverSWEs below
-    // are COPIED LINE-FOR-LINE from cuAdvectionMSWEsCartesianKernel (the validated (c)/T2 kernel).
+    // 【KERNEL 同步清单 — 见 T5_design.md / T6_design.md §5】: the h/hU reconstruction + cuHLLCRiemannSolverSWEs
+    // below are COPIED LINE-FOR-LINE from cuAdvectionMSWEsCartesianKernel (the validated (c)/T2 kernel).
     // These two are TWINS. **If EITHER kernel's advection/Riemann logic changes, the OTHER MUST be
     // synced in lockstep.** Kept separate (not unified) on purpose: the sediment stack arrays
     // (c_this_sed[MAXSED] etc.) raise register pressure, so the n_sed=0 passive path must use the
     // (c) kernel (no sediment locals) to keep its +9.2% / byte-exact win. (this kernel: n_sed>0 only.)
+    // T6: the // [phos] lines (hPd + per-group hPp_k) are PURE APPENDED riders on the SAME live _h_flux
+    // upwind — new vars only (pd_*/pp_*/_hPd_advection/_hPps_advection), NEVER interleaved with nor
+    // sharing a temporary with the h/hU arithmetic -> nvcc does not reorder the h/hU FMAs -> h/hU stays
+    // byte-identical (phosphorus_on == off; verified by the raw-cmp gate). They DO grow this kernel's
+    // register/stack footprint (checked "不失控" by cuobjdump); the n_sed=0 (c) kernel is untouched.
     // =====================================================================================
-    __global__ void cuAdvectionMSWEsCartesianWithSedimentKernel(Scalar* gravity, Scalar* h, Scalar* _h_bound, Scalar* z, Scalar* _z_bound, Vector* z_gradient, Vector* hU, Vector* _hU_bound, unsigned int phi_size, ShortDualHandle* cell_neigbours, unsigned int cell_neighbours_length, Scalar* cell_volume, Scalar* h_advection, Vector* hU_advection, Scalar* hC, Scalar* _C_bound, Scalar* hC_advection_out, Scalar** hCs, Scalar** Csbound, Scalar** hCs_adv, int n_sed){
+    __global__ void cuAdvectionMSWEsCartesianWithSedimentKernel(Scalar* gravity, Scalar* h, Scalar* _h_bound, Scalar* z, Scalar* _z_bound, Vector* z_gradient, Vector* hU, Vector* _hU_bound, unsigned int phi_size, ShortDualHandle* cell_neigbours, unsigned int cell_neighbours_length, Scalar* cell_volume, Scalar* h_advection, Vector* hU_advection, Scalar* hC, Scalar* _C_bound, Scalar* hC_advection_out, Scalar** hCs, Scalar** Csbound, Scalar** hCs_adv, int n_sed, Scalar* hPd, Scalar* _Pd_bound, Scalar* hPd_advection_out, Scalar** hPps, Scalar** Ppsbound, Scalar** hPps_adv, int n_phos){
 
       unsigned int index = blockDim.x * blockIdx.x + threadIdx.x;
       Scalar h_small = 1e-10;
@@ -1056,6 +1061,14 @@ namespace GC{
           c_this_sed[ks] = (h_this >= h_small) ? hCs[ks][index] / h_this : (Scalar)0.0;
           _hCs_advection[ks] = (Scalar)0.0;
         }
+        Scalar pd_this = (hPd && h_this >= h_small) ? hPd[index] / h_this : (Scalar)0.0; // [phos] dissolved P (like tracer)
+        Scalar _hPd_advection(0.0);                                                      // [phos]
+        Scalar pp_this_phos[MAXSED];                                                     // [phos] particulate P per group (n_phos<=MAXSED)
+        Scalar _hPps_advection[MAXSED];                                                  // [phos]
+        for (int kp = 0; kp < n_phos; ++kp){                                            // [phos]
+          pp_this_phos[kp] = (h_this >= h_small) ? hPps[kp][index] / h_this : (Scalar)0.0;
+          _hPps_advection[kp] = (Scalar)0.0;
+        }
         for (Flag i = 0; i < 4; ++i){
           Vector2 normal = face_normal[i];
           Vector2 shear = face_shear[i];
@@ -1067,6 +1080,8 @@ namespace GC{
           Vector2 _z_gradient_neib = 0.0;
           Scalar c_neib = 0.0;                                                          // [tracer]
           Scalar c_neib_sed[MAXSED];                                                     // [sed]
+          Scalar pd_neib = 0.0;                                                          // [phos]
+          Scalar pp_neib_phos[MAXSED];                                                   // [phos]
           if (!neib.is_boundary()){
             Flag id_neib = neib.get_global_id();
             g_neib = gravity[id_neib];
@@ -1077,6 +1092,9 @@ namespace GC{
             c_neib = (hC && h_neib >= h_small) ? hC[id_neib] / h_neib : (Scalar)0.0;    // [tracer]
             for (int ks = 0; ks < n_sed; ++ks)                                          // [sed] interior neighbour conc
               c_neib_sed[ks] = (h_neib >= h_small) ? hCs[ks][id_neib] / h_neib : (Scalar)0.0;
+            pd_neib = (hPd && h_neib >= h_small) ? hPd[id_neib] / h_neib : (Scalar)0.0; // [phos] interior dissolved P
+            for (int kp = 0; kp < n_phos; ++kp)                                         // [phos] interior particulate P
+              pp_neib_phos[kp] = (h_neib >= h_small) ? hPps[kp][id_neib] / h_neib : (Scalar)0.0;
           }
           else{
             Flag id_boundary = neib.get_global_id();
@@ -1087,6 +1105,9 @@ namespace GC{
             c_neib = (hC && h_neib >= h_small) ? _C_bound[id_boundary] : (Scalar)0.0;   // [tracer] (boundary conc)
             for (int ks = 0; ks < n_sed; ++ks)                                          // [sed] boundary neighbour conc
               c_neib_sed[ks] = (h_neib >= h_small) ? Csbound[ks][id_boundary] : (Scalar)0.0;
+            pd_neib = (hPd && h_neib >= h_small) ? _Pd_bound[id_boundary] : (Scalar)0.0; // [phos] boundary dissolved P
+            for (int kp = 0; kp < n_phos; ++kp)                                         // [phos] boundary particulate P
+              pp_neib_phos[kp] = (h_neib >= h_small) ? Ppsbound[kp][id_boundary] : (Scalar)0.0;
           }
           if (h_this < h_small && h_neib < h_small){
             continue;
@@ -1135,19 +1156,28 @@ namespace GC{
           _hC_advection += ((_h_flux >= (Scalar)0.0) ? _h_flux*c_this : _h_flux*c_neib) * area / volume;   // [tracer]
           for (int ks = 0; ks < n_sed; ++ks)                                            // [sed] same _h_flux, 1st-order upwind
             _hCs_advection[ks] += ((_h_flux >= (Scalar)0.0) ? _h_flux*c_this_sed[ks] : _h_flux*c_neib_sed[ks]) * area / volume;
+          _hPd_advection += ((_h_flux >= (Scalar)0.0) ? _h_flux*pd_this : _h_flux*pd_neib) * area / volume;          // [phos] same live _h_flux
+          for (int kp = 0; kp < n_phos; ++kp)                                           // [phos] same _h_flux, 1st-order upwind
+            _hPps_advection[kp] += ((_h_flux >= (Scalar)0.0) ? _h_flux*pp_this_phos[kp] : _h_flux*pp_neib_phos[kp]) * area / volume;
         }
         h_advection[index] = _h_advection;
         hU_advection[index] = _hU_advection;
         if (hC_advection_out) hC_advection_out[index] = _hC_advection;                  // [tracer]
         for (int ks = 0; ks < n_sed; ++ks)                                              // [sed] output per group
           if (hCs_adv) hCs_adv[ks][index] = _hCs_advection[ks];
+        if (hPd_advection_out) hPd_advection_out[index] = _hPd_advection;               // [phos] dissolved out
+        for (int kp = 0; kp < n_phos; ++kp)                                            // [phos] output per group
+          if (hPps_adv) hPps_adv[kp][index] = _hPps_advection[kp];
         __syncthreads();
         index += blockDim.x * gridDim.x;
       }
     }
 
     // T5 fork wrapper: single-GPU run() uses this when n_sed>0 (h/hU + passive C + sediment, one pass).
-    void cuAdvectionMSWEsCartesianWithSediment(cuFvMappedField<Scalar, on_cell>& gravity, cuFvMappedField<Scalar, on_cell>& h, cuFvMappedField<Scalar, on_cell>& z, cuFvMappedField<Vector, on_cell>& z_gradient, cuFvMappedField<Vector, on_cell>& hU, cuFvMappedField<Scalar, on_cell>& C, cuFvMappedField<Scalar, on_cell>& hC, cuFvMappedField<Scalar, on_cell>& h_advection, cuFvMappedField<Vector, on_cell>& hU_advection, cuFvMappedField<Scalar, on_cell>& hC_advection, Scalar** hCs_dev, Scalar** Csbound_dev, Scalar** hCs_adv_dev, int n_sed){
+    // T6: also carries the // [phos] riders (dissolved hPd + per-group particulate hPp_k) on the SAME
+    // _h_flux. Phosphorus fields are POINTERS (nullptr / n_phos=0 when phosphorus is off) so the caller
+    // needs no dummy Pd objects for sediment-only runs; the kernel guards on (hPd != nullptr) / n_phos.
+    void cuAdvectionMSWEsCartesianWithSediment(cuFvMappedField<Scalar, on_cell>& gravity, cuFvMappedField<Scalar, on_cell>& h, cuFvMappedField<Scalar, on_cell>& z, cuFvMappedField<Vector, on_cell>& z_gradient, cuFvMappedField<Vector, on_cell>& hU, cuFvMappedField<Scalar, on_cell>& C, cuFvMappedField<Scalar, on_cell>& hC, cuFvMappedField<Scalar, on_cell>& h_advection, cuFvMappedField<Vector, on_cell>& hU_advection, cuFvMappedField<Scalar, on_cell>& hC_advection, Scalar** hCs_dev, Scalar** Csbound_dev, Scalar** hCs_adv_dev, int n_sed, Scalar* hPd, Scalar* Pd_bound, Scalar* hPd_adv, Scalar** hPps_dev, Scalar** Ppsbound_dev, Scalar** hPps_adv_dev, int n_phos){
 
       auto mesh = h.mesh;
 
@@ -1168,7 +1198,8 @@ namespace GC{
         hC.data.dev_ptr(),
         C.boundary_value.dev_ptr(),
         hC_advection.data.dev_ptr(),
-        hCs_dev, Csbound_dev, hCs_adv_dev, n_sed);
+        hCs_dev, Csbound_dev, hCs_adv_dev, n_sed,
+        hPd, Pd_bound, hPd_adv, hPps_dev, Ppsbound_dev, hPps_adv_dev, n_phos);   // [phos]
     }
 
     __global__ void cuAdvectionNSWEsSRMCartesianKernel(Scalar* gravity, Scalar* centrifugal, Scalar* h, Scalar* _h_bound, Scalar* z, Scalar* _z_bound, Vector* z_gradient, Vector* hU, Vector* _hU_bound, unsigned int phi_size, ShortDualHandle* cell_neigbours, unsigned int cell_neighbours_length, Scalar* cell_volume, Scalar* h_advection, Vector* hU_advection){

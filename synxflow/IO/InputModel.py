@@ -568,14 +568,32 @@ class InputModel:
         T6_literature.md), written verbatim to input/phosphorus_setup.dat; the solver reads
         them (NO phosphorus value hard-coded in the kernel).
         """
+        # 口径 I (T6_wiring_plan B): Langmuir q*(Pd) is the SOLE equilibrium reference; EPC0 never enters
+        # the kernel rate. EPC0 is a measured anchor handled HERE: if a group gives EPC0 but no q0, derive
+        # q0 = q*(EPC0) = Qmax*K*EPC0/(1+K*EPC0). If both are given and inconsistent, WARN (no silent pick).
+        for k, g in enumerate(groups):
+            Qmax = float(g.get('Qmax', 0.0))
+            K = float(g.get('K', 0.0))
+            if 'EPC0' in g and Qmax > 0.0 and K > 0.0:
+                kp = K * float(g['EPC0'])
+                q0_from_epc0 = Qmax * kp / (1.0 + kp)
+                if 'q0' not in g:
+                    g['q0'] = q0_from_epc0
+                else:
+                    q0 = float(g['q0'])
+                    tol = 1e-6 * max(1.0, abs(q0_from_epc0))
+                    if abs(q0 - q0_from_epc0) > tol:
+                        warnings.warn(
+                            'phosphorus group %d: q0=%g is inconsistent with q*(EPC0)=%g '
+                            '(Qmax=%g,K=%g,EPC0=%g). 口径 I keeps both but the isotherm will not pass '
+                            'through (EPC0,q0); set only one.' % (k, q0, q0_from_epc0, Qmax, K, float(g['EPC0'])))
         self._phosphorus_groups = groups
         self._phosphorus_sorption_mode = int(sorption_mode)
         self._phosphorus_on = bool(phosphorus_on)
-        # dissolved-phase initial concentration: scalar -> .dat; array -> grid file 'Pd' (reuse 'C' channel)
-        if np.ndim(pd_init) == 0:
-            self._phosphorus_pd_init = pd_init
-        else:
-            self._phosphorus_pd_init = 0.0
+        # dissolved-phase initial concentration: written to .dat AND registered as grid 'Pd' (the solver
+        # reads field/Pd for the actual init; reuses the 'C' grid mechanism). Scalar -> uniform grid.
+        self._phosphorus_pd_init = pd_init if np.ndim(pd_init) == 0 else 0.0
+        if phosphorus_on:
             tag = 'Pd'
             if tag not in InputModel.__grid_files:
                 InputModel.__grid_files.append(tag)

@@ -61,6 +61,8 @@
 #include "cuda_advection_NSWEs.h"
 //T5: pluggable sediment transport (config parser + per-group params)
 #include "cuda_sediment.h"
+//T6: pluggable phosphorus sorption-transport (config + closures + operators; rides the T5 framework)
+#include "cuda_phosphorus.h"
 #include <vector>
 #include <memory>
 #include <string>
@@ -187,6 +189,24 @@ int run(const char* work_dir){
   }
   if (n_sed > 0) std::cout << "T5: " << n_sed << " sediment group(s) (morphology_on=" << sed_cfg.morphology_on << ")" << std::endl;
 
+  //T6: read pluggable phosphorus config (absent file / phosphorus_on=0 -> n_phos=0 -> identical to T5).
+  //  Phosphorus is OPT-IN and binds the sediment groups: n_phos == n_sed (design §3). Refuse mismatch
+  //  rather than silently mis-index. Dissolved phase needs no sediment; particulate phase needs n_sed>0.
+  PhosphorusConfig phos_cfg = read_phosphorus_setup("input/phosphorus_setup.dat");
+  int n_phos = phos_cfg.phosphorus_on ? phos_cfg.n_groups() : 0;
+  if (n_phos > 0 && n_sed <= 0){
+    std::cerr << "ERROR: phosphorus_on but no sediment groups; particulate phosphorus needs n_sed>0 "
+              << "(pure dissolved-conservative P is the T2 (c) path, not T6)." << std::endl;
+    return -1;
+  }
+  if (n_phos > 0 && n_phos != n_sed){
+    std::cerr << "ERROR: phosphorus groups (" << n_phos << ") must equal sediment groups (" << n_sed
+              << ") — each group's phosphorus sorbs on that group's sediment (design §3)." << std::endl;
+    return -1;
+  }
+  if (n_phos > 0) std::cout << "T6: " << n_phos << " phosphorus group(s) (sorption_mode="
+                            << phos_cfg.sorption_mode_id << ", Pd_init=" << phos_cfg.Pd_init << ")" << std::endl;
+
   //precipitation
   fvScalarFieldOnCell precipitation_host(fvMeshQueries(mesh), completeFieldReader("input/field/", "precipitation"));
 
@@ -306,6 +326,55 @@ int run(const char* work_dir){
     checkCuda(cudaMemcpy(params_dev,  sed_cfg.groups.data(), n_sed * sizeof(SedimentParams), cudaMemcpyHostToDevice));
   }
 
+  //T6: phosphorus fields (only when n_phos>0). Dissolved hPd=h*Pd (reactive scalar, like hC but with
+  //  sorption source/sink). Per-group particulate hPp_k=h*(C_sed_k*q_k); init q_k=q0 => hPp_k=hC_k*q0,
+  //  bedPp_k=bed_k*q0. Pp_k (=hPp_k/h) carries the advection upwind conc + boundary. All NEW fields —
+  //  T5 sediment fields untouched. dmass_dbg stays nullptr in production (only the cross-test sets it).
+  std::shared_ptr<cuFvMappedField<Scalar, on_cell>> Pd_p, hPd_p, hPd_adv_p;
+  std::vector<std::shared_ptr<cuFvMappedField<Scalar, on_cell>>> Ppsed, hPpsed, hPpsed_adv, bedPp;
+  Scalar **hPps_dev = nullptr, **Ppsbound_dev = nullptr, **hPps_adv_dev = nullptr, **bedPps_dev = nullptr;
+  PhosphorusParams *pparams_dev = nullptr;
+  if (n_phos > 0){
+    fvScalarFieldOnCell Pd_host(fvMeshQueries(mesh), completeFieldReader("input/field/", "Pd"));
+    Pd_p      = std::make_shared<cuFvMappedField<Scalar, on_cell>>(Pd_host, mesh_ptr_dev);
+    hPd_p     = std::make_shared<cuFvMappedField<Scalar, on_cell>>(h, partial);
+    hPd_adv_p = std::make_shared<cuFvMappedField<Scalar, on_cell>>(h, partial);
+    Pd_p->update_time(time_controller.current(), 0.0);
+    Pd_p->update_boundary_values();
+    fv::cuBinary(h, *Pd_p, *hPd_p, [] __device__(Scalar& a, Scalar& b) -> Scalar{ return a*b; });   // hPd = h*Pd
+    std::vector<Scalar*> hPps_host(n_phos), Ppsbound_host(n_phos), hPps_adv_host(n_phos), bedPps_host(n_phos);
+    for (int k = 0; k < n_phos; ++k){
+      Ppsed.push_back(std::make_shared<cuFvMappedField<Scalar, on_cell>>(h, partial));        // Pp_k conc (=hPp_k/h)
+      hPpsed.push_back(std::make_shared<cuFvMappedField<Scalar, on_cell>>(h, partial));        // conserved hPp_k
+      hPpsed_adv.push_back(std::make_shared<cuFvMappedField<Scalar, on_cell>>(h, partial));     // advection rider
+      bedPp.push_back(std::make_shared<cuFvMappedField<Scalar, on_cell>>(h, partial));          // bed sorbed-P store
+      Scalar q0 = phos_cfg.groups[k].q0;
+      fv::cuUnary(*hCsed[k], *hPpsed[k], [q0] __device__(Scalar& a) -> Scalar{ return a*q0; });  // hPp_k = hC_k*q0
+      fv::cuUnary(*bed[k],   *bedPp[k],  [q0] __device__(Scalar& a) -> Scalar{ return a*q0; });  // bedPp_k = bed_k*q0
+      fv::cuBinary(*hPpsed[k], h, *Ppsed[k], [] __device__(Scalar& a, Scalar& b) -> Scalar{ return b >= (Scalar)1e-10 ? a / b : (Scalar)0.0; });  // Pp_k = hPp_k/h
+      Ppsed[k]->update_time(time_controller.current(), 0.0);
+      Ppsed[k]->update_boundary_values();
+      hPps_host[k]     = hPpsed[k]->data.dev_ptr();
+      Ppsbound_host[k] = Ppsed[k]->boundary_value.dev_ptr();
+      hPps_adv_host[k] = hPpsed_adv[k]->data.dev_ptr();
+      bedPps_host[k]   = bedPp[k]->data.dev_ptr();
+    }
+    checkCuda(cudaMalloc(&hPps_dev,     n_phos * sizeof(Scalar*)));
+    checkCuda(cudaMalloc(&Ppsbound_dev, n_phos * sizeof(Scalar*)));
+    checkCuda(cudaMalloc(&hPps_adv_dev, n_phos * sizeof(Scalar*)));
+    checkCuda(cudaMalloc(&bedPps_dev,   n_phos * sizeof(Scalar*)));
+    checkCuda(cudaMalloc(&pparams_dev,  n_phos * sizeof(PhosphorusParams)));
+    checkCuda(cudaMemcpy(hPps_dev,     hPps_host.data(),     n_phos * sizeof(Scalar*), cudaMemcpyHostToDevice));
+    checkCuda(cudaMemcpy(Ppsbound_dev, Ppsbound_host.data(), n_phos * sizeof(Scalar*), cudaMemcpyHostToDevice));
+    checkCuda(cudaMemcpy(hPps_adv_dev, hPps_adv_host.data(), n_phos * sizeof(Scalar*), cudaMemcpyHostToDevice));
+    checkCuda(cudaMemcpy(bedPps_dev,   bedPps_host.data(),   n_phos * sizeof(Scalar*), cudaMemcpyHostToDevice));
+    checkCuda(cudaMemcpy(pparams_dev,  phos_cfg.groups.data(), n_phos * sizeof(PhosphorusParams), cudaMemcpyHostToDevice));
+  }
+  //T6: stable device pointers for the phosphorus advection riders (nullptr when phosphorus off).
+  Scalar* hPd_ptr     = (n_phos > 0) ? hPd_p->data.dev_ptr()              : nullptr;
+  Scalar* Pd_bound_ptr= (n_phos > 0) ? Pd_p->boundary_value.dev_ptr()     : nullptr;
+  Scalar* hPd_adv_ptr = (n_phos > 0) ? hPd_adv_p->data.dev_ptr()          : nullptr;
+
   //ascii raster writer
   cuGisAsciiWriter raster_writer("input/mesh/DEM.txt");
 
@@ -359,6 +428,9 @@ int run(const char* work_dir){
     std::string nm = "C" + std::to_string(k);
     Csed[k]->update_boundary_source("input/field/", nm.c_str());
   }
+  if (n_phos > 0){                                       //T6: dissolved-P boundary source (like 'C'); particulate-P uses its field boundary
+    Pd_p->update_boundary_source("input/field/", "Pd");
+  }
 
   //Main loop
   do{
@@ -373,7 +445,8 @@ int run(const char* work_dir){
     //T5 fork: n_sed=0 keeps the validated (c) WithTracer kernel (no sediment register pressure);
     //  n_sed>0 uses the twin WithSediment kernel (same _h_flux upwind for all groups, one pass).
     if (n_sed > 0){
-      fv::cuAdvectionMSWEsCartesianWithSediment(gravity, h, z, z_gradient, hU, C, hC, h_advection, hU_advection, hC_advection, hCs_dev, Csbound_dev, hCs_adv_dev, n_sed); //SRM
+      fv::cuAdvectionMSWEsCartesianWithSediment(gravity, h, z, z_gradient, hU, C, hC, h_advection, hU_advection, hC_advection, hCs_dev, Csbound_dev, hCs_adv_dev, n_sed,
+        hPd_ptr, Pd_bound_ptr, hPd_adv_ptr, hPps_dev, Ppsbound_dev, hPps_adv_dev, n_phos); //SRM + T6 [phos] riders (no-op when n_phos=0)
     }
     else{
       fv::cuAdvectionMSWEsCartesianWithTracer(gravity, h, z, z_gradient, hU, C, hC, h_advection, hU_advection, hC_advection); //SRM
@@ -387,6 +460,12 @@ int run(const char* work_dir){
     //T5 step 2: per-group Euler (advection ONLY — E-D source/sink is step 3, never added here).
     for (int k = 0; k < n_sed; ++k)
       fv::cuEulerIntegrator(*hCsed[k], *hCsed_adv[k], -1.0*time_controller.dt(), time_controller.current());
+    //T6 §5: phosphorus Euler (advection ONLY — sorption + bed transfer are source/sink, applied below).
+    if (n_phos > 0){
+      fv::cuEulerIntegrator(*hPd_p, *hPd_adv_p, -1.0*time_controller.dt(), time_controller.current());
+      for (int k = 0; k < n_phos; ++k)
+        fv::cuEulerIntegrator(*hPpsed[k], *hPpsed_adv[k], -1.0*time_controller.dt(), time_controller.current());
+    }
 
     //integration
     fv::cuFrictionManningImplicit(time_controller.dt(), gravity, manning_coef, h, hU, hU_advection);
@@ -409,12 +488,28 @@ int run(const char* work_dir){
     fv::cuBinary(hC, h, C, [] __device__(Scalar& a, Scalar& b) -> Scalar{ return b >= (Scalar)1e-10 ? a / b : (Scalar)0.0; });
     C.update_time(time_controller.current(), time_controller.dt());
     C.update_boundary_values();
+    //T6 R5: source/sink changed h (hPd untouched = pure-water source/sink). Recompute Pd = hPd/h (dry->0)
+    //for output + next-step boundary upwind. (sorption below redistributes hPd<->hPp_k, not h.)
+    if (n_phos > 0){
+      fv::cuBinary(*hPd_p, h, *Pd_p, [] __device__(Scalar& a, Scalar& b) -> Scalar{ return b >= (Scalar)1e-10 ? a / b : (Scalar)0.0; });
+      Pd_p->update_time(time_controller.current(), time_controller.dt());
+      Pd_p->update_boundary_values();
+    }
     //T5 step3: E-D source/sink on the advected hC_k (WithSediment path only — n_sed=0 NEVER reaches here).
     //  tau_b from current Manning friction + velocity; per-group erosion/deposition with R5 positivity;
     //  bed_k store conserves mass; Delta-z_accum computed but NOT applied to z (§4 morphology extension point).
     if (n_sed > 0){
       fv::cuSedimentBedShear(manning_coef, gravity, h, hU, tau_b);
+      //T6 §7 (route ①): phosphorus bed transfer runs BEFORE E-D, reading the SAME pre-E-D read-only
+      //  fields (h, tau_b, hC_k, bed_k); it recomputes the identical per-group dmass via the SAME
+      //  sed_ED_rate + R5 clamp and moves ONLY hPp_k<->bedPp_k. cuSedimentErosionDeposition is then
+      //  called UNCHANGED (one byte untouched). production dmass_dbg = nullptr.
+      if (n_phos > 0)
+        fv::cuPhosphorusBedTransfer(h, tau_b, hCs_dev, beds_dev, hPps_dev, bedPps_dev, params_dev, n_phos, time_controller.dt(), nullptr);
       fv::cuSedimentErosionDeposition(h, tau_b, hCs_dev, beds_dev, dz_accum.data.dev_ptr(), params_dev, n_sed, time_controller.dt());
+      //T6 §5: sorption exchange Pd<->hPp_k (Langmuir, 口径 I) on the post-advection/post-transfer state.
+      if (n_phos > 0)
+        fv::cuPhosphorusSorption(h, *hPd_p, hPps_dev, hCs_dev, pparams_dev, phos_cfg.sorption_mode_id, n_phos, time_controller.dt());
     }
 
     //T5 R5: per-group recompute C_k = hC_k/h (dry->0) for output + next-step boundary upwind
@@ -422,6 +517,19 @@ int run(const char* work_dir){
       fv::cuBinary(*hCsed[k], h, *Csed[k], [] __device__(Scalar& a, Scalar& b) -> Scalar{ return b >= (Scalar)1e-10 ? a / b : (Scalar)0.0; });
       Csed[k]->update_time(time_controller.current(), time_controller.dt());
       Csed[k]->update_boundary_values();
+    }
+    //T6 R5: sorption changed hPd + hPp_k. Recompute Pd=hPd/h and Pp_k=hPp_k/h (dry->0) for output +
+    //  next-step boundary upwind. (C revision: hPp_k follows hC_k — the dry-cell zeroing below keeps
+    //  them in lockstep; q_k=hPp_k/hC_k itself is formed with its own guard inside the operators.)
+    if (n_phos > 0){
+      fv::cuBinary(*hPd_p, h, *Pd_p, [] __device__(Scalar& a, Scalar& b) -> Scalar{ return b >= (Scalar)1e-10 ? a / b : (Scalar)0.0; });
+      Pd_p->update_time(time_controller.current(), time_controller.dt());
+      Pd_p->update_boundary_values();
+      for (int k = 0; k < n_phos; ++k){
+        fv::cuBinary(*hPpsed[k], h, *Ppsed[k], [] __device__(Scalar& a, Scalar& b) -> Scalar{ return b >= (Scalar)1e-10 ? a / b : (Scalar)0.0; });
+        Ppsed[k]->update_time(time_controller.current(), time_controller.dt());
+        Ppsed[k]->update_boundary_values();
+      }
     }
 
     //update maximum depth
@@ -467,6 +575,13 @@ int run(const char* work_dir){
     //T5 R5: per-group dry-cell hC_k zeroing
     for (int k = 0; k < n_sed; ++k)
       fv::cuBinaryOn(*hCsed[k], h, [] __device__(Scalar& a, Scalar& b) -> Scalar{ return b <= (Scalar)1e-10 ? (Scalar)0.0 : a; });
+    //T6 R5 (revision C): dry-cell zeroing — hPd follows h, hPp_k follows hC_k (dry h -> hC_k=0 -> hPp_k=0),
+    //  so sorbed P never orphans in a sediment-empty / dry cell. bedPp_k is a bed store (not water-bound).
+    if (n_phos > 0){
+      fv::cuBinaryOn(*hPd_p, h, [] __device__(Scalar& a, Scalar& b) -> Scalar{ return b <= (Scalar)1e-10 ? (Scalar)0.0 : a; });
+      for (int k = 0; k < n_phos; ++k)
+        fv::cuBinaryOn(*hPpsed[k], h, [] __device__(Scalar& a, Scalar& b) -> Scalar{ return b <= (Scalar)1e-10 ? (Scalar)0.0 : a; });
+    }
 
 
     cudaEventRecord(stop);
@@ -491,6 +606,15 @@ int run(const char* work_dir){
         raster_writer.write(*bed[k], bnm.c_str(), t_out);
       }
       if (n_sed > 0) raster_writer.write(dz_accum, "dz_accum", t_out);  //T5 §4: computed, NOT applied to z
+      if (n_phos > 0){                                     //T6: dissolved P + per-group particulate/bed P raster
+        raster_writer.write(*Pd_p, "Pd", t_out);
+        for (int k = 0; k < n_phos; ++k){
+          std::string pnm = "Pp" + std::to_string(k);
+          raster_writer.write(*Ppsed[k], pnm.c_str(), t_out);
+          std::string bpnm = "bedPp" + std::to_string(k);
+          raster_writer.write(*bedPp[k], bpnm.c_str(), t_out);
+        }
+      }
       t_out += dt_out;
     }
     
@@ -512,6 +636,12 @@ int run(const char* work_dir){
   if (hCs_adv_dev) cudaFree(hCs_adv_dev);
   if (beds_dev)    cudaFree(beds_dev);
   if (params_dev)  cudaFree(params_dev);
+  //T6: free phosphorus device pointer arrays (per-group field buffers freed by shared_ptr dtors)
+  if (hPps_dev)     cudaFree(hPps_dev);
+  if (Ppsbound_dev) cudaFree(Ppsbound_dev);
+  if (hPps_adv_dev) cudaFree(hPps_adv_dev);
+  if (bedPps_dev)   cudaFree(bedPps_dev);
+  if (pparams_dev)  cudaFree(pparams_dev);
 
   printf("Writing maximum inundated depth.\n");
   raster_writer.write(h_max, "h_max", t_all);
