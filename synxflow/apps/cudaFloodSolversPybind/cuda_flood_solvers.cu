@@ -65,6 +65,7 @@
 #include "cuda_phosphorus.h"
 #include <vector>
 #include <memory>
+#include <cstdlib>   //T6: getenv for the env-gated dmass-consistency cross-test
 #include <string>
 //The header file for gradient
 #include "cuda_gradient.h"
@@ -375,6 +376,25 @@ int run(const char* work_dir){
   Scalar* Pd_bound_ptr= (n_phos > 0) ? Pd_p->boundary_value.dev_ptr()     : nullptr;
   Scalar* hPd_adv_ptr = (n_phos > 0) ? hPd_adv_p->data.dev_ptr()          : nullptr;
 
+  //T6 route①守闸: bit-exact dmass consistency cross-test (env-gated; OFF / nullptr in production).
+  //  When SYNXFLOW_T6_DMASS_CHECK is set, cuPhosphorusBedTransfer writes its per-group dmass to
+  //  dmass_dbg; we snapshot hC_k just before the bed-transfer/E-D pair and, after E-D, assert
+  //  float(hC_pre + dmass_dbg) == hC_post for EVERY cell. If the bed-transfer's dmass equals the
+  //  (untouched) E-D kernel's dmass bit-for-bit, the identical float add reproduces hC_post exactly;
+  //  any mismatch (drift between the two dmass sites) is counted and reported.
+  const bool t6_dmass_check = (std::getenv("SYNXFLOW_T6_DMASS_CHECK") != nullptr);
+  Scalar** dmass_dbg_dev = nullptr;
+  std::vector<Scalar*> dmass_dbg_buf;
+  unsigned long long t6_dmass_mismatch = 0, t6_dmass_active = 0;
+  if (t6_dmass_check && n_phos > 0){
+    dmass_dbg_buf.resize(n_phos);
+    std::vector<Scalar*> hostarr(n_phos);
+    for (int k = 0; k < n_phos; ++k){ checkCuda(cudaMalloc(&dmass_dbg_buf[k], h.data.size()*sizeof(Scalar))); hostarr[k] = dmass_dbg_buf[k]; }
+    checkCuda(cudaMalloc(&dmass_dbg_dev, n_phos * sizeof(Scalar*)));
+    checkCuda(cudaMemcpy(dmass_dbg_dev, hostarr.data(), n_phos * sizeof(Scalar*), cudaMemcpyHostToDevice));
+    std::cout << "T6 dmass-consistency cross-test: ON" << std::endl;
+  }
+
   //ascii raster writer
   cuGisAsciiWriter raster_writer("input/mesh/DEM.txt");
 
@@ -504,9 +524,27 @@ int run(const char* work_dir){
       //  fields (h, tau_b, hC_k, bed_k); it recomputes the identical per-group dmass via the SAME
       //  sed_ED_rate + R5 clamp and moves ONLY hPp_k<->bedPp_k. cuSedimentErosionDeposition is then
       //  called UNCHANGED (one byte untouched). production dmass_dbg = nullptr.
+      std::vector<std::vector<Scalar>> t6_hc_pre;   //守闸: hC_k snapshot just before bed-transfer/E-D
+      if (t6_dmass_check && n_phos > 0){
+        t6_hc_pre.assign(n_phos, std::vector<Scalar>(h.data.size()));
+        for (int k = 0; k < n_phos; ++k)
+          checkCuda(cudaMemcpy(t6_hc_pre[k].data(), hCsed[k]->data.dev_ptr(), h.data.size()*sizeof(Scalar), cudaMemcpyDeviceToHost));
+      }
       if (n_phos > 0)
-        fv::cuPhosphorusBedTransfer(h, tau_b, hCs_dev, beds_dev, hPps_dev, bedPps_dev, params_dev, n_phos, time_controller.dt(), nullptr);
+        fv::cuPhosphorusBedTransfer(h, tau_b, hCs_dev, beds_dev, hPps_dev, bedPps_dev, params_dev, n_phos, time_controller.dt(), t6_dmass_check ? dmass_dbg_dev : nullptr);
       fv::cuSedimentErosionDeposition(h, tau_b, hCs_dev, beds_dev, dz_accum.data.dev_ptr(), params_dev, n_sed, time_controller.dt());
+      if (t6_dmass_check && n_phos > 0){             //守闸: assert float(hC_pre + dmass_dbg) == hC_post bit-exact
+        std::vector<Scalar> hc_post(h.data.size()), dd(h.data.size());
+        for (int k = 0; k < n_phos; ++k){
+          checkCuda(cudaMemcpy(hc_post.data(), hCsed[k]->data.dev_ptr(), h.data.size()*sizeof(Scalar), cudaMemcpyDeviceToHost));
+          checkCuda(cudaMemcpy(dd.data(),      dmass_dbg_buf[k],         h.data.size()*sizeof(Scalar), cudaMemcpyDeviceToHost));
+          for (size_t i = 0; i < h.data.size(); ++i){
+            Scalar recon = (Scalar)(t6_hc_pre[k][i] + dd[i]);   // same float add the E-D kernel applied
+            if (dd[i] != (Scalar)0.0) ++t6_dmass_active;        // count cells where E-D actually moved mass
+            if (recon != hc_post[i]) ++t6_dmass_mismatch;       // bit-exact mismatch => dmass drift
+          }
+        }
+      }
       //T6 §5: sorption exchange Pd<->hPp_k (Langmuir, 口径 I) on the post-advection/post-transfer state.
       if (n_phos > 0)
         fv::cuPhosphorusSorption(h, *hPd_p, hPps_dev, hCs_dev, pparams_dev, phos_cfg.sorption_mode_id, n_phos, time_controller.dt());
@@ -642,6 +680,14 @@ int run(const char* work_dir){
   if (hPps_adv_dev) cudaFree(hPps_adv_dev);
   if (bedPps_dev)   cudaFree(bedPps_dev);
   if (pparams_dev)  cudaFree(pparams_dev);
+  //T6 route①守闸: report the bit-exact dmass cross-test (only when env-gated check was on)
+  if (t6_dmass_check && n_phos > 0){
+    std::cout << "T6 DMASS-CONSISTENCY: mismatches=" << t6_dmass_mismatch
+              << " over active(E-D moved mass) cells=" << t6_dmass_active
+              << "  -> " << (t6_dmass_mismatch == 0 ? "BIT-EXACT PASS" : "FAIL") << std::endl;
+    for (Scalar* p : dmass_dbg_buf) if (p) cudaFree(p);
+    if (dmass_dbg_dev) cudaFree(dmass_dbg_dev);
+  }
 
   printf("Writing maximum inundated depth.\n");
   raster_writer.write(h_max, "h_max", t_all);
