@@ -486,6 +486,9 @@ class InputModel:
         # T5: write sediment_setup.dat when sediment groups were defined
         if (file_tag is None or file_tag == 'all') and getattr(self, '_sediment_groups', None):
             self._write_sediment_setup()
+        # T6: write phosphorus_setup.dat when phosphorus groups were defined
+        if (file_tag is None or file_tag == 'all') and getattr(self, '_phosphorus_groups', None):
+            self._write_phosphorus_setup()
 
     def write_grid_files(self, file_tag, is_single_gpu=False):
         """Write grid-based files
@@ -545,6 +548,56 @@ class InputModel:
                     if key in g:
                         f.write('%s %s\n' % (key, g[key]))
         print('sediment_setup.dat created (%d groups)' % len(self._sediment_groups))
+
+    def set_phosphorus_groups(self, groups, sorption_mode=0, phosphorus_on=True,
+                              pd_init=0.0):
+        """T6 pluggable phosphorus sorption-transport framework: define per-group P params.
+
+        Args:
+            groups: list of dict; per group keys: Qmax, K, EPC0, k_ads, q0. Indices align
+                1:1 with the sediment groups set via set_sediment_groups (group k's phosphorus
+                sorbs on sediment group k). Omitted keys default to 0 (Qmax=0 => inert group).
+            sorption_mode: 0=kinetics (default), 1=instant equilibrium. Global (T6_design §4).
+            phosphorus_on: master switch (default True). False writes phosphorus_on=0, i.e.
+                byte-level fallback to the T5 path.
+            pd_init: dissolved-phase initial concentration [mg/L]. Scalar -> written into
+                phosphorus_setup.dat ($dissolved Pd_init). DEM-shaped array -> grid file 'Pd'
+                (reuses the 'C' grid mechanism); the scalar Pd_init is then left 0.
+
+        Numbers are example/placeholder inputs (literature occupancy values, see
+        T6_literature.md), written verbatim to input/phosphorus_setup.dat; the solver reads
+        them (NO phosphorus value hard-coded in the kernel).
+        """
+        self._phosphorus_groups = groups
+        self._phosphorus_sorption_mode = int(sorption_mode)
+        self._phosphorus_on = bool(phosphorus_on)
+        # dissolved-phase initial concentration: scalar -> .dat; array -> grid file 'Pd' (reuse 'C' channel)
+        if np.ndim(pd_init) == 0:
+            self._phosphorus_pd_init = pd_init
+        else:
+            self._phosphorus_pd_init = 0.0
+            tag = 'Pd'
+            if tag not in InputModel.__grid_files:
+                InputModel.__grid_files.append(tag)
+                InputModel._file_tag_list.append(tag)
+            self.attributes[tag] = pd_init
+
+    def _write_phosphorus_setup(self):
+        """Write input/phosphorus_setup.dat (sectioned key=value), read by C++ read_phosphorus_setup()."""
+        input_dir = os.path.dirname(self._data_folders['field'])
+        path = os.path.join(input_dir, 'phosphorus_setup.dat')
+        keys = ['Qmax', 'K', 'EPC0', 'k_ads', 'q0']
+        with open(path, 'w') as f:
+            f.write('$phosphorus_on\n%d\n' % (1 if self._phosphorus_on else 0))
+            f.write('$sorption_mode\n%d\n' % int(self._phosphorus_sorption_mode))
+            for k, g in enumerate(self._phosphorus_groups):
+                f.write('$pgroup %d\n' % k)
+                for key in keys:
+                    if key in g:
+                        f.write('%s %s\n' % (key, g[key]))
+            f.write('$dissolved\n')
+            f.write('Pd_init %s\n' % self._phosphorus_pd_init)
+        print('phosphorus_setup.dat created (%d groups)' % len(self._phosphorus_groups))
 
     def write_boundary_conditions(self):
         """ Write boundary condtion files
